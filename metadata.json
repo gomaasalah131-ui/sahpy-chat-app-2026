@@ -1,0 +1,6 @@
+{
+  "name": "نبض شات - منصة المراسلة الفورية الاحترافية",
+  "description": "واجهة محادثات فورية متكاملة على غرار واتساب ويب مع خلفيات متحركة ملونة، كتم الإشعارات، حظر جهات الاتصال، رسائل صوتية، ومكالمات تفاعلية.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

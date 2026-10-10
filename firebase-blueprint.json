@@ -1,0 +1,235 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Authenticated user profile and global chat preferences.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name of the user.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "phoneTag": {
+          "type": "string",
+          "description": "Normalized registered phone number identifier.",
+          "minLength": 7,
+          "maxLength": 20,
+          "pattern": "^[0-9+]+$"
+        },
+        "bio": {
+          "type": "string",
+          "description": "Personal status or bio text.",
+          "minLength": 0,
+          "maxLength": 200
+        },
+        "wallpaperTheme": {
+          "type": "string",
+          "description": "Selected animated wallpaper theme ID.",
+          "enum": [
+            "aurora-borealis",
+            "neon-waves",
+            "cosmic-nebula",
+            "sunset-liquid",
+            "emerald-matrix",
+            "royal-amethyst"
+          ]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "uid",
+        "displayName",
+        "phoneTag",
+        "bio",
+        "wallpaperTheme",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SavedContact": {
+      "title": "SavedContact",
+      "description": "A contact conversation saved under a user's workspace with mute, block, and wallpaper settings.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "description": "UID of the user who owns this contact record.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "contactName": {
+          "type": "string",
+          "description": "Display name of the contact.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "contactPhone": {
+          "type": "string",
+          "description": "Registered phone number of the contact.",
+          "minLength": 7,
+          "maxLength": 20,
+          "pattern": "^[0-9+]+$"
+        },
+        "contactBio": {
+          "type": "string",
+          "description": "Bio or status text of the contact.",
+          "minLength": 0,
+          "maxLength": 200
+        },
+        "avatarFallbackColor": {
+          "type": "string",
+          "description": "Tailwind background class for avatar fallback.",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "isMuted": {
+          "type": "boolean",
+          "description": "Whether notifications for this contact are muted."
+        },
+        "isBlocked": {
+          "type": "boolean",
+          "description": "Whether this contact is blocked."
+        },
+        "isPinned": {
+          "type": "boolean",
+          "description": "Whether this contact is pinned in the sidebar."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "ownerUid",
+        "contactName",
+        "contactPhone",
+        "contactBio",
+        "avatarFallbackColor",
+        "isMuted",
+        "isBlocked",
+        "isPinned",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "A chat message persisted inside a contact conversation.",
+      "type": "object",
+      "properties": {
+        "ownerUid": {
+          "type": "string",
+          "description": "UID of the user who owns this conversation.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "contactId": {
+          "type": "string",
+          "description": "Parent contact document ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "senderRole": {
+          "type": "string",
+          "description": "Whether the message was sent by 'me' or 'contact'.",
+          "enum": ["me", "contact"]
+        },
+        "senderName": {
+          "type": "string",
+          "description": "Display name of the sender.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "text": {
+          "type": "string",
+          "description": "Message text content.",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "messageType": {
+          "type": "string",
+          "description": "Message type.",
+          "enum": ["text", "voice", "image", "file", "poll"]
+        },
+        "displayTime": {
+          "type": "string",
+          "description": "Formatted display timestamp string.",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "isStarred": {
+          "type": "boolean",
+          "description": "Whether the message is starred."
+        },
+        "isPinned": {
+          "type": "boolean",
+          "description": "Whether the message is pinned."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "ownerUid",
+        "contactId",
+        "senderRole",
+        "senderName",
+        "text",
+        "messageType",
+        "displayTime",
+        "isStarred",
+        "isPinned",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Stores isolated user profile and wallpaper settings for each authenticated user."
+    },
+    "/users/{userId}/contacts/{contactId}": {
+      "schema": { "$ref": "#/entities/SavedContact" },
+      "description": "Stores the user's contacts, mute state, block state, and pin state."
+    },
+    "/users/{userId}/contacts/{contactId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/ChatMessage" },
+      "description": "Stores messages within a specific contact conversation."
+    }
+  }
+}

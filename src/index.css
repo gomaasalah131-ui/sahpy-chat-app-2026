@@ -1,0 +1,170 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --color-brand-gray: #1A1A1A;
+}
+
+@layer base {
+  :root {
+    --font-display: "Inter", 'Readex Pro', 'Cairo', sans-serif;
+    --font-body: "Inter", 'Cairo', 'Readex Pro', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+  }
+
+  body {
+    @apply font-sans bg-black text-white antialiased;
+    font-feature-settings: "kern" 1;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: var(--font-display);
+  }
+
+  .font-mono, .tabular-nums {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Custom sleek scrollbars for page, chat list and message stream */
+html {
+  scroll-behavior: smooth;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(16, 185, 129, 0.45);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(16, 185, 129, 0.75);
+}
+
+/* Compositor-only (transform, opacity) animations for colorful chat wallpapers */
+@keyframes auroraDriftOne {
+  0%, 100% {
+    transform: translate3d(0%, 0%, 0) scale(1) rotate(0deg);
+  }
+  33% {
+    transform: translate3d(12%, -10%, 0) scale(1.14) rotate(8deg);
+  }
+  66% {
+    transform: translate3d(-10%, 12%, 0) scale(0.92) rotate(-6deg);
+  }
+}
+
+@keyframes auroraDriftTwo {
+  0%, 100% {
+    transform: translate3d(0%, 0%, 0) scale(1) rotate(0deg);
+  }
+  33% {
+    transform: translate3d(-14%, 10%, 0) scale(1.18) rotate(-10deg);
+  }
+  66% {
+    transform: translate3d(11%, -12%, 0) scale(0.94) rotate(9deg);
+  }
+}
+
+@keyframes auroraDriftThree {
+  0%, 100% {
+    transform: translate3d(0%, 0%, 0) scale(1);
+  }
+  50% {
+    transform: translate3d(15%, 14%, 0) scale(1.22);
+  }
+}
+
+@keyframes pulseGlowSlow {
+  0%, 100% {
+    opacity: 0.35;
+    transform: scale(0.96);
+  }
+  50% {
+    opacity: 0.75;
+    transform: scale(1.06);
+  }
+}
+
+@keyframes floatParticle {
+  0%, 100% {
+    transform: translate3d(0, 0, 0);
+    opacity: 0.25;
+  }
+  50% {
+    transform: translate3d(-18px, -28px, 0);
+    opacity: 0.85;
+  }
+}
+
+@keyframes waveFlow {
+  0%, 100% {
+    transform: translate3d(-4%, 0, 0) scaleY(1);
+  }
+  50% {
+    transform: translate3d(4%, -2%, 0) scaleY(1.08);
+  }
+}
+
+.animate-aurora-1 {
+  animation: auroraDriftOne 16s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  will-change: transform;
+}
+
+.animate-aurora-2 {
+  animation: auroraDriftTwo 20s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  will-change: transform;
+}
+
+.animate-aurora-3 {
+  animation: auroraDriftThree 24s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  will-change: transform;
+}
+
+.animate-aurora-fast-1 {
+  animation: auroraDriftOne 8s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  will-change: transform;
+}
+
+.animate-aurora-fast-2 {
+  animation: auroraDriftTwo 10s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  will-change: transform;
+}
+
+.animate-aurora-fast-3 {
+  animation: auroraDriftThree 12s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+  will-change: transform;
+}
+
+.animate-glow-slow {
+  animation: pulseGlowSlow 7s ease-in-out infinite;
+  will-change: transform, opacity;
+}
+
+.animate-wave-flow {
+  animation: waveFlow 12s ease-in-out infinite;
+  will-change: transform;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-aurora-1,
+  .animate-aurora-2,
+  .animate-aurora-3,
+  .animate-aurora-fast-1,
+  .animate-aurora-fast-2,
+  .animate-aurora-fast-3,
+  .animate-glow-slow,
+  .animate-wave-flow {
+    animation: none !important;
+  }
+}
