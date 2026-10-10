@@ -317,7 +317,7 @@ export const WallpaperStudioModal: React.FC<WallpaperStudioModalProps> = ({
                   <div className="mb-1 flex items-center justify-between text-[11px] text-slate-400">
                     <span>شفافية نقش الخلفية</span>
                     <span className="font-mono tabular-nums">
-                      {Math.round(config.patternOpacity * 100)}%
+                      {Math.round((config.patternOpacity ?? 0.08) * 100)}%
                     </span>
                   </div>
                   <input
@@ -325,7 +325,7 @@ export const WallpaperStudioModal: React.FC<WallpaperStudioModalProps> = ({
                     min="0.03"
                     max="0.24"
                     step="0.01"
-                    value={config.patternOpacity}
+                    value={config.patternOpacity ?? 0.08}
                     onChange={(e) =>
                       onUpdateConfig({
                         ...config,

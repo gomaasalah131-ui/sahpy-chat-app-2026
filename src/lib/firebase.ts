@@ -380,6 +380,16 @@ export async function signOutFromCloud(): Promise<void> {
   await signOut(auth);
 }
 
+export async function logoutFromFirebase(): Promise<void> {
+  await signOutFromCloud();
+}
+
+export function subscribeToAuthChanges(
+  callback: (user: User | null) => void
+): () => void {
+  return onAuthStateChanged(auth, callback);
+}
+
 // ============================================================================
 // 2. FIRESTORE USER PROFILES & ATOMIC UNIQUE USERNAME RESERVATION
 // ============================================================================
@@ -1241,6 +1251,169 @@ export function subscribeToUserContacts(
       handleFirestoreError(error, OperationType.LIST, path);
     }
   );
+}
+
+export async function fetchUserProfileByUid(
+  uid: string
+): Promise<FirestoreUserProfileData | null> {
+  return getOwnUserProfileFromFirestore(uid);
+}
+
+export function getDeterministicChatId(uidA: string, uidB: string): string {
+  return buildDeterministicChatId(uidA, uidB);
+}
+
+export async function ensureAuthorizedChatRoomInFirestore(params: {
+  myUid: string;
+  otherUid: string;
+  myName?: string;
+  otherName?: string;
+  myUsername?: string;
+  otherUsername?: string;
+}): Promise<string> {
+  return createOrGetAuthorizedChatRoom({
+    myUid: params.myUid,
+    myName: params.myName || auth.currentUser?.displayName || 'مستخدم',
+    myUsername: params.myUsername || 'user_chat',
+    otherUid: params.otherUid,
+    otherName: params.otherName || params.otherUsername || 'مستخدم',
+    otherUsername: params.otherUsername || 'user_chat',
+  });
+}
+
+export async function sendDirectMessageToAuthorizedChat(params: {
+  id?: string;
+  senderUid: string;
+  recipientUid: string;
+  senderName: string;
+  senderUsername?: string;
+  text: string;
+  type?: 'text' | 'voice' | 'image' | 'file' | 'poll' | 'sticker';
+  displayTime?: string;
+}): Promise<void> {
+  const chatId = buildDeterministicChatId(params.senderUid, params.recipientUid);
+  const msgId = params.id || `msg_${Date.now()}`;
+  const timeStr =
+    params.displayTime ||
+    new Date().toLocaleTimeString('ar-EG', {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  await sendAuthorizedMessageToChatRoom({
+    chatId,
+    messageId: msgId,
+    senderUid: params.senderUid,
+    recipientUid: params.recipientUid,
+    senderName: params.senderName,
+    senderUsername: params.senderUsername || 'user_chat',
+    text: params.text,
+    messageType: params.type || 'text',
+    displayTime: timeStr,
+  });
+}
+
+export function subscribeToAuthorizedChatMessages(
+  chatId: string,
+  onMessagesChanged: (
+    messages: Array<{
+      id: string;
+      senderUid: string;
+      recipientUid: string;
+      senderName: string;
+      text: string;
+      type: 'text' | 'voice' | 'image' | 'sticker';
+      createdAt: number;
+    }>
+  ) => void
+): () => void {
+  const uid = auth.currentUser?.uid || '';
+  if (!uid || !chatId) return () => {};
+  return subscribeToAuthorizedDirectMessages(uid, chatId, (items) => {
+    onMessagesChanged(
+      items.map((m) => ({
+        id: m.id,
+        senderUid: m.senderUid,
+        recipientUid: m.recipientUid,
+        senderName: m.senderName,
+        text: m.text,
+        type:
+          m.messageType === 'voice' ||
+          m.messageType === 'image' ||
+          m.messageType === 'sticker'
+            ? m.messageType
+            : 'text',
+        createdAt: m.createdAtMs || Date.now(),
+      }))
+    );
+  });
+}
+
+export function subscribeToFirestoreUsers(
+  onUsersSnapshot: (
+    cloudUsers: Array<{
+      id: string;
+      uid: string;
+      name: string;
+      phone: string;
+      normalizedPhone: string;
+      username: string;
+      bio: string;
+      avatar: string;
+      isOnline: boolean;
+      lastSeen: string;
+    }>
+  ) => void
+): () => void {
+  const uid = auth.currentUser?.uid || '';
+  if (!uid || !auth.currentUser?.emailVerified) return () => {};
+  return subscribeToUserContacts(uid, (contacts) => {
+    onUsersSnapshot(
+      contacts.map((c) => ({
+        id: c.id,
+        uid: c.id,
+        name: c.contactName,
+        phone: c.contactPhone,
+        normalizedPhone: c.contactPhone.replace(/\D/g, ''),
+        username: sanitizeUsername(c.contactName) || c.id,
+        bio: c.contactBio,
+        avatar: '',
+        isOnline: true,
+        lastSeen: 'موثق في Firestore',
+      }))
+    );
+  });
+}
+
+export function subscribeToFirestoreMessages(
+  onMessagesSnapshot: (
+    cloudMsgs: Array<{
+      id: string;
+      senderPhone: string;
+      senderName: string;
+      recipientPhone: string;
+      text: string;
+      timestamp: string;
+      type: 'text' | 'voice' | 'image' | 'sticker';
+    }>
+  ) => void
+): () => void {
+  const uid = auth.currentUser?.uid || '';
+  if (!uid || !auth.currentUser?.emailVerified) return () => {};
+  return subscribeToAuthorizedChatRooms(uid, (rooms) => {
+    onMessagesSnapshot(
+      rooms
+        .filter((r) => Boolean(r.lastMessageText))
+        .map((r) => ({
+          id: `room_${r.chatId}`,
+          senderPhone: r.otherUid,
+          senderName: r.otherName,
+          recipientPhone: uid,
+          text: r.lastMessageText,
+          timestamp: r.lastMessageTime,
+          type: 'text' as const,
+        }))
+    );
+  });
 }
 
 // Compatibility helpers used by App.tsx

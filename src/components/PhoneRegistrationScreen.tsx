@@ -137,8 +137,8 @@ interface PhoneRegistrationScreenProps {
   currentUsername?: string;
   currentBio: string;
   currentAvatar?: string;
-  firebaseUser: User | null;
-  isAccountFullyVerified: boolean;
+  firebaseUser?: User | null;
+  isAccountFullyVerified?: boolean;
   registeredUsers: RegisteredDirectoryUser[];
   onCompleteRegistration: (data: {
     uid: string;
@@ -152,9 +152,9 @@ interface PhoneRegistrationScreenProps {
     phoneVerified: boolean;
     stayOnScreen?: boolean;
   }) => Promise<void>;
-  onLogout: () => Promise<void>;
+  onLogout?: () => Promise<void>;
   onStartChatWithUser: (user: RegisteredDirectoryUser) => void;
-  onBackToChats: () => void;
+  onBackToChats?: () => void;
 }
 
 export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = ({
@@ -960,7 +960,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                   type="button"
                   onClick={async () => {
                     await signOutFromCloud();
-                    await onLogout();
+                    if (onLogout) await onLogout();
                     setAuthTab('login');
                     setSuccessMsg('تم تسجيل الخروج بنجاح من Firebase Authentication.');
                   }}

@@ -526,7 +526,9 @@ export const ContactInfoDrawer: React.FC<ContactInfoDrawerProps> = ({
                       <div className="truncate text-xs font-medium text-slate-200">
                         {item.title}
                       </div>
-                      <div className="text-[11px] text-slate-400">{item.subtitle}</div>
+                      <div className="text-[11px] text-slate-400">
+                        {item.subtitle || (item.size ? `${item.date} • ${item.size}` : item.date)}
+                      </div>
                     </div>
                   </div>
                 ))}

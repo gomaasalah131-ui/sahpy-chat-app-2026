@@ -59,12 +59,14 @@ export interface Message {
     text: string;
   };
   isStarred?: boolean;
+  isPinned?: boolean;
 }
 
 export interface SharedMediaItem {
   id: string;
   url: string;
   title: string;
+  subtitle?: string;
   date: string;
   size?: string;
   type?: 'image' | 'file' | 'link';

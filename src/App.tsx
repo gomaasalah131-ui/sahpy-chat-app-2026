@@ -2555,8 +2555,11 @@ export default function App() {
         currentUsername={userUsername}
         currentBio={userBio}
         currentAvatar={userAvatar}
+        firebaseUser={auth.currentUser}
+        isAccountFullyVerified={canEnterProtectedChats}
         registeredUsers={registeredUsers}
         onCompleteRegistration={handleCompleteRegistration}
+        onLogout={handleRealLogout}
         onStartChatWithUser={handleStartChatWithDirectoryUser}
         onBackToChats={
           canEnterProtectedChats ? () => setViewMode('chat') : undefined
