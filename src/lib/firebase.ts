@@ -252,8 +252,16 @@ export function isValidPhoneE164Format(countryCode: string, localDigits: string)
 
 export function translateFirebaseAuthError(error: unknown): string {
   const rawMsg = error instanceof Error ? error.message : String(error || '');
-  const code = (error as { code?: string })?.code || rawMsg;
+  const rawCode = (error as { code?: string })?.code || '';
+  const code = rawCode || rawMsg;
+  const currentHost =
+    typeof window !== 'undefined' && window.location?.hostname
+      ? window.location.hostname
+      : 'current-domain';
 
+  if (rawMsg.includes('OTP_REQUEST_IN_FLIGHT')) {
+    return 'يوجد طلب إرسال رمز SMS قيد التنفيذ حالياً. يرجى الانتظار حتى يكتمل الطلب الحالي.';
+  }
   if (rawMsg.includes('USERNAME_TAKEN')) {
     return 'اسم المستخدم (Username) محجوز ومستخدم بالفعل من قبل حساب آخر. يرجى اختيار اسم مستخدم فريد.';
   }
@@ -264,67 +272,188 @@ export function translateFirebaseAuthError(error: unknown): string {
     return 'اسم المستخدم هذا غير مسجل. تأكد من كتابته بشكل صحيح أو سجّل الدخول بالبريد الإلكتروني.';
   }
   if (code.includes('auth/email-already-in-use')) {
-    return 'البريد الإلكتروني مسجل بالفعل في Firebase Authentication. يرجى تسجيل الدخول بدلاً من إنشاء حساب جديد.';
+    return 'البريد الإلكتروني مسجل بالفعل في Firebase Authentication [auth/email-already-in-use]. يرجى تسجيل الدخول بدلاً من إنشاء حساب جديد.';
   }
   if (code.includes('auth/invalid-email')) {
-    return 'صيغة البريد الإلكتروني غير صحيحة. يرجى كتابة بريد إلكتروني صالح.';
+    return 'صيغة البريد الإلكتروني غير صحيحة [auth/invalid-email]. يرجى كتابة بريد إلكتروني صالح.';
   }
   if (code.includes('auth/weak-password')) {
-    return 'كلمة المرور ضعيفة. يجب أن تتكون من 8 أحرف على الأقل وتحتوي على أحرف وأرقام.';
+    return 'كلمة المرور ضعيفة [auth/weak-password]. يجب أن تتكون من 8 أحرف على الأقل وتحتوي على أحرف وأرقام.';
   }
   if (
     code.includes('auth/user-not-found') ||
     code.includes('auth/wrong-password') ||
     code.includes('auth/invalid-credential')
   ) {
-    return 'بيانات تسجيل الدخول غير صحيحة (البريد الإلكتروني أو كلمة المرور غير مطابقة).';
+    return `بيانات تسجيل الدخول غير صحيحة (البريد الإلكتروني أو كلمة المرور غير مطابقة) [${rawCode || 'auth/invalid-credential'}].`;
   }
   if (code.includes('auth/too-many-requests')) {
-    return 'تم إيقاف المحاولات مؤقتاً لحماية الحساب بسبب كثرة الطلبات المتتالية. يرجى المحاولة بعد دقائق.';
+    return 'تم إيقاف المحاولات مؤقتاً من Firebase لحماية الحساب بسبب كثرة الطلبات المتتالية [auth/too-many-requests]. يرجى المحاولة بعد دقائق.';
   }
   if (code.includes('auth/invalid-verification-code')) {
-    return 'رمز التحقق (OTP) غير صحيح. يرجى التأكد من الأرقام الستة المرسلة إلى هاتفك.';
+    return 'رمز التحقق (OTP) غير صحيح [auth/invalid-verification-code]. يرجى التأكد من الأرقام الستة المرسلة إلى هاتفك.';
   }
   if (code.includes('auth/code-expired')) {
-    return 'انتهت صلاحية رمز التحقق (OTP). يرجى الضغط على "إعادة إرسال رمز التحقق".';
+    return 'انتهت صلاحية رمز التحقق (OTP) [auth/code-expired]. يرجى الضغط على "إعادة إرسال SMS".';
   }
-  if (code.includes('auth/invalid-phone-number')) {
-    return 'رقم الهاتف غير صالح. تأكد من اختيار رمز الدولة الصحيح وإدخال الرقم بدون أخطاء.';
+  if (
+    code.includes('auth/invalid-phone-number') ||
+    code.includes('auth/missing-phone-number')
+  ) {
+    return `رقم الهاتف غير صالح وفق صيغة E.164 الدولية [${rawCode || 'auth/invalid-phone-number'}]. تأكد من اختيار رمز الدولة الصحيح وإدخال الرقم بدون الصفر الابتدائي.`;
   }
   if (
     code.includes('auth/credential-already-in-use') ||
     code.includes('auth/phone-number-already-exists') ||
     code.includes('auth/account-exists-with-different-credential')
   ) {
-    return 'رقم الهاتف أو البريد الإلكتروني مرتبط بالفعل بحساب مستخدم آخر.';
+    return `رقم الهاتف أو البريد الإلكتروني مرتبط بالفعل بحساب مستخدم آخر في Firebase [${rawCode || 'auth/credential-already-in-use'}].`;
   }
-  if (code.includes('auth/operation-not-allowed')) {
-    return 'طريقة المصادقة هذه (Email/Password أو Phone SMS) غير مفعّلة بعد في Firebase Console. يرجى تفعيلها من Authentication > Sign-in method في لوحة تحكم Firebase، أو استخدام تسجيل الدخول عبر Google.';
+  if (code.includes('auth/provider-already-linked')) {
+    return 'تم ربط رقم هاتف بهذا الحساب مسبقاً [auth/provider-already-linked].';
+  }
+  if (
+    code.includes('auth/operation-not-allowed') ||
+    rawMsg.includes('OPERATION_NOT_ALLOWED')
+  ) {
+    return `خطأ Firebase حقيقي [auth/operation-not-allowed]: مزود المصادقة برقم الهاتف (Phone Authentication) أو (Email/Password) غير مفعّل حالياً في مشروع Firebase (${firebaseConfig.projectId}). لتفعيل إرسال SMS: افتح Firebase Console > Authentication > Sign-in method ثم فعّل مزود "Phone" واحفظ التغييرات.`;
+  }
+  if (
+    code.includes('auth/unauthorized-domain') ||
+    code.includes('auth/app-not-authorized') ||
+    rawMsg.includes('UNAUTHORIZED_DOMAIN')
+  ) {
+    return `خطأ Firebase حقيقي [${rawCode || 'auth/unauthorized-domain'}]: النطاق الحالي (${currentHost}) غير مضاف ضمن النطاقات المصرح بها (Authorized domains). يرجى إضافته في Firebase Console > Authentication > Settings > Authorized domains.`;
   }
   if (
     code.includes('auth/billing-not-enabled') ||
-    code.includes('auth/quota-exceeded')
+    code.includes('auth/quota-exceeded') ||
+    rawMsg.includes('BILLING_NOT_ENABLED') ||
+    rawMsg.includes('QUOTA_EXCEEDED')
   ) {
-    return 'إرسال رسائل SMS الفعلية عبر Firebase Phone Auth يتطلب تفعيل خطة Blaze في Firebase Console أو إضافة الرقم ضمن "Phone numbers for testing" في إعدادات Phone Auth.';
+    return `خطأ Firebase حقيقي [${rawCode || 'auth/billing-not-enabled'}]: إرسال رسائل SMS الفعلية عبر Firebase Phone Auth يتطلب تفعيل خطة الفوترة (Blaze Plan) في مشروع Firebase (${firebaseConfig.projectId})، أو إضافة رقمك كرقم اختبار في Firebase Console > Authentication > Sign-in method > Phone > Phone numbers for testing.`;
   }
   if (
     code.includes('auth/captcha-check-failed') ||
     code.includes('auth/invalid-app-credential') ||
     code.includes('auth/missing-app-credential')
   ) {
-    return 'تعذر التحقق من reCAPTCHA لإرسال رسالة SMS. تأكد من إضافة نطاق الموقع الحالي ضمن Authorized domains في Firebase Console > Authentication > Settings.';
+    return `خطأ Firebase حقيقي [${rawCode || 'auth/captcha-check-failed'}]: تعذر التحقق من reCAPTCHA v2 لإرسال رسالة SMS على النطاق (${currentHost}). تأكد من إكمال تحدي reCAPTCHA ومن إضافة النطاق (${currentHost}) ضمن Authorized domains في Firebase Console > Authentication > Settings.`;
   }
   if (code.includes('auth/popup-closed-by-user')) {
-    return 'تم إغلاق نافذة تسجيل الدخول قبل إكمال العملية.';
+    return 'تم إغلاق نافذة تسجيل الدخول قبل إكمال العملية [auth/popup-closed-by-user].';
   }
   if (code.includes('auth/network-request-failed')) {
-    return 'خطأ في الاتصال بالشبكة. يرجى التحقق من اتصال الإنترنت والمحاولة مرة أخرى.';
+    return 'خطأ في الاتصال بالشبكة [auth/network-request-failed]. يرجى التحقق من اتصال الإنترنت وعدم حجب google.com/recaptcha.';
+  }
+  if (code.includes('auth/internal-error')) {
+    return `خطأ داخلي من Firebase [auth/internal-error]: (${rawMsg}). غالباً ما يحدث بسبب عدم تفعيل مزود Phone في Firebase Console أو عدم تفويض النطاق (${currentHost}) في Authorized domains.`;
   }
   if (code.includes('auth/requires-recent-login')) {
-    return 'لأسباب أمنية، يرجى تسجيل الخروج ثم تسجيل الدخول مجدداً لإتمام هذه العملية الحساسة.';
+    return 'لأسباب أمنية [auth/requires-recent-login]، يرجى تسجيل الخروج ثم تسجيل الدخول مجدداً لإتمام هذه العملية الحساسة.';
   }
 
-  return rawMsg || 'حدث خطأ غير متوقع أثناء الاتصال بـ Firebase. يرجى المحاولة مرة أخرى.';
+  return rawCode
+    ? `خطأ من Firebase [${rawCode}]: ${rawMsg}`
+    : rawMsg || 'حدث خطأ غير متوقع أثناء الاتصال بـ Firebase. يرجى المحاولة مرة أخرى.';
+}
+
+export interface FirebasePhoneAuthDiagnostics {
+  projectId: string;
+  authDomain: string;
+  currentHostname: string;
+  authorizedDomains: string[];
+  isCurrentDomainAuthorized: boolean;
+  recaptchaEnterpriseConfigured: boolean;
+  recaptchaV2SiteKeyPresent: boolean;
+  phoneAuthProbeStatus: 'unknown' | 'operation_not_allowed' | 'ready_or_requires_token' | 'error';
+  phoneAuthProbeDetail: string;
+}
+
+/**
+ * Inspects live Firebase Identity Toolkit configuration & Authorized Domains
+ * for the current project without disabling reCAPTCHA or exposing secrets.
+ */
+export async function inspectFirebasePhoneAuthEnvironment(): Promise<FirebasePhoneAuthDiagnostics> {
+  const currentHostname =
+    typeof window !== 'undefined' && window.location?.hostname
+      ? window.location.hostname
+      : 'localhost';
+  const apiKey = firebaseConfig.apiKey;
+  let authorizedDomains: string[] = [];
+  let recaptchaEnterpriseConfigured = false;
+  let recaptchaV2SiteKeyPresent = false;
+  let phoneAuthProbeStatus: FirebasePhoneAuthDiagnostics['phoneAuthProbeStatus'] =
+    'unknown';
+  let phoneAuthProbeDetail = '';
+
+  try {
+    const projRes = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/projects?key=${encodeURIComponent(apiKey)}`
+    );
+    if (projRes.ok) {
+      const projData = await projRes.json();
+      if (Array.isArray(projData.authorizedDomains)) {
+        authorizedDomains = projData.authorizedDomains;
+      }
+    }
+  } catch {
+    // ignore network error during diagnostics
+  }
+
+  try {
+    const entRes = await fetch(
+      `https://identitytoolkit.googleapis.com/v2/recaptchaConfig?key=${encodeURIComponent(apiKey)}&clientType=CLIENT_TYPE_WEB&version=RECAPTCHA_ENTERPRISE`
+    );
+    if (entRes.ok) {
+      const entData = await entRes.json();
+      recaptchaEnterpriseConfigured = Boolean(
+        entData.recaptchaKey ||
+          entData.useSmsBotScore ||
+          entData.useSmsTollFraudProtection
+      );
+    }
+  } catch {
+    // ignore
+  }
+
+  try {
+    const v2Res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/recaptchaParams?key=${encodeURIComponent(apiKey)}`
+    );
+    if (v2Res.ok) {
+      const v2Data = await v2Res.json();
+      recaptchaV2SiteKeyPresent = Boolean(v2Data.recaptchaSiteKey);
+    }
+  } catch {
+    // ignore
+  }
+
+  const isCurrentDomainAuthorized =
+    authorizedDomains.length === 0
+      ? true
+      : authorizedDomains.some(
+          (d) =>
+            d.toLowerCase() === currentHostname.toLowerCase() ||
+            currentHostname.toLowerCase().endsWith(`.${d.toLowerCase()}`)
+        );
+
+  if (!recaptchaEnterpriseConfigured && recaptchaV2SiteKeyPresent) {
+    phoneAuthProbeDetail =
+      'ملاحظة: رسالة "Failed to initialize reCAPTCHA Enterprise config. Triggering the reCAPTCHA v2 verification." هي تنبيه طبيعي من حزمة Firebase لأن المشروع يستخدم reCAPTCHA v2 القياسي (المجاني) بدلاً من reCAPTCHA Enterprise المدفوع.';
+  }
+
+  return {
+    projectId: firebaseConfig.projectId,
+    authDomain: firebaseConfig.authDomain,
+    currentHostname,
+    authorizedDomains,
+    isCurrentDomainAuthorized,
+    recaptchaEnterpriseConfigured,
+    recaptchaV2SiteKeyPresent,
+    phoneAuthProbeStatus,
+    phoneAuthProbeDetail,
+  };
 }
 
 // ============================================================================
@@ -388,8 +517,30 @@ export async function reloadAndCheckCurrentUser(): Promise<User | null> {
 }
 
 let activeRecaptchaVerifier: RecaptchaVerifier | null = null;
+let activeRecaptchaWidgetId: number | null = null;
+let activeRecaptchaContainerId: string | null = null;
+let activeRecaptchaSize: 'invisible' | 'normal' | null = null;
+let isPhoneOtpRequestInFlight = false;
 
-export function clearRecaptchaVerifier(): void {
+export function clearRecaptchaVerifier(containerId?: string): void {
+  const targetId =
+    containerId || activeRecaptchaContainerId || 'firebase-recaptcha-container';
+
+  if (
+    activeRecaptchaWidgetId !== null &&
+    typeof window !== 'undefined' &&
+    (window as unknown as { grecaptcha?: { reset?: (id?: number) => void } })
+      .grecaptcha?.reset
+  ) {
+    try {
+      (
+        window as unknown as { grecaptcha: { reset: (id?: number) => void } }
+      ).grecaptcha.reset(activeRecaptchaWidgetId);
+    } catch {
+      // ignore grecaptcha reset error
+    }
+  }
+
   if (activeRecaptchaVerifier) {
     try {
       activeRecaptchaVerifier.clear();
@@ -398,36 +549,180 @@ export function clearRecaptchaVerifier(): void {
     }
     activeRecaptchaVerifier = null;
   }
+
+  activeRecaptchaWidgetId = null;
+  activeRecaptchaSize = null;
+
+  if (typeof document !== 'undefined') {
+    const outerContainer = document.getElementById(targetId);
+    if (outerContainer) {
+      outerContainer.innerHTML = '';
+    }
+  }
+}
+
+/**
+ * Resets an existing reCAPTCHA v2 widget if possible, or clears and rebuilds it cleanly.
+ */
+export function resetRecaptchaVerifier(containerId?: string): void {
+  clearRecaptchaVerifier(containerId);
+}
+
+/**
+ * Initializes (or reuses) a real Firebase RecaptchaVerifier (v2 fallback supported)
+ * inside a clean mount element so repeated attempts never collide with stale DOM state.
+ * Never disables reCAPTCHA in production.
+ */
+export async function ensureRecaptchaVerifier(
+  recaptchaContainerId: string,
+  size: 'invisible' | 'normal' = 'invisible',
+  callbacks?: {
+    onSolved?: () => void;
+    onExpired?: () => void;
+    onError?: (err: unknown) => void;
+  }
+): Promise<RecaptchaVerifier> {
+  if (typeof document === 'undefined') {
+    throw new Error('بيئة المتصفح غير متاحة لتهيئة reCAPTCHA.');
+  }
+
+  const outerContainer = document.getElementById(recaptchaContainerId);
+  if (!outerContainer) {
+    throw new Error(
+      `لم يتم العثور على عنصر حاوية reCAPTCHA (#${recaptchaContainerId}) في الصفحة.`
+    );
+  }
+
+  // If we already have an active verifier with the same container and size, reset its widget and reuse it
+  if (
+    activeRecaptchaVerifier &&
+    activeRecaptchaContainerId === recaptchaContainerId &&
+    activeRecaptchaSize === size &&
+    activeRecaptchaWidgetId !== null &&
+    outerContainer.childElementCount > 0
+  ) {
+    try {
+      const grecaptchaObj = (
+        window as unknown as { grecaptcha?: { reset?: (id?: number) => void } }
+      ).grecaptcha;
+      if (grecaptchaObj?.reset) {
+        grecaptchaObj.reset(activeRecaptchaWidgetId);
+        return activeRecaptchaVerifier;
+      }
+    } catch {
+      // If resetting the existing widget fails, fall through and recreate cleanly
+    }
+  }
+
+  clearRecaptchaVerifier(recaptchaContainerId);
+
+  // Create a fresh inner mount node inside outerContainer to prevent
+  // "reCAPTCHA has already been rendered in this element" errors on retries
+  const mountNode = document.createElement('div');
+  mountNode.id = `${recaptchaContainerId}-widget-${Date.now()}`;
+  outerContainer.innerHTML = '';
+  outerContainer.appendChild(mountNode);
+
+  activeRecaptchaContainerId = recaptchaContainerId;
+  activeRecaptchaSize = size;
+
+  activeRecaptchaVerifier = new RecaptchaVerifier(auth, mountNode, {
+    size,
+    callback: () => {
+      callbacks?.onSolved?.();
+    },
+    'expired-callback': () => {
+      callbacks?.onExpired?.();
+      clearRecaptchaVerifier(recaptchaContainerId);
+    },
+    'error-callback': (err: unknown) => {
+      callbacks?.onError?.(err);
+      clearRecaptchaVerifier(recaptchaContainerId);
+    },
+  });
+
+  activeRecaptchaWidgetId = await activeRecaptchaVerifier.render();
+  return activeRecaptchaVerifier;
 }
 
 export async function sendPhoneOtpViaFirebase(
   phoneE164: string,
-  recaptchaContainerId: string
+  recaptchaContainerId: string,
+  options?: {
+    recaptchaSize?: 'invisible' | 'normal';
+    preferSignInWithPhoneNumber?: boolean;
+  }
 ): Promise<ConfirmationResult> {
-  clearRecaptchaVerifier();
-  const container = document.getElementById(recaptchaContainerId);
-  if (container) {
-    container.innerHTML = '';
+  if (isPhoneOtpRequestInFlight) {
+    throw new Error('OTP_REQUEST_IN_FLIGHT');
   }
 
-  activeRecaptchaVerifier = new RecaptchaVerifier(auth, recaptchaContainerId, {
-    size: 'normal',
-  });
-
-  await activeRecaptchaVerifier.render();
-
-  if (auth.currentUser) {
-    return await linkWithPhoneNumber(
-      auth.currentUser,
-      phoneE164,
-      activeRecaptchaVerifier
-    );
+  const cleanPhone = String(phoneE164 || '').trim();
+  if (!/^\+[1-9]\d{7,14}$/.test(cleanPhone)) {
+    throw {
+      code: 'auth/invalid-phone-number',
+      message: 'Invalid E.164 phone number format.',
+    };
   }
-  return await signInWithPhoneNumber(
-    auth,
-    phoneE164,
-    activeRecaptchaVerifier
-  );
+
+  isPhoneOtpRequestInFlight = true;
+  const size = options?.recaptchaSize || 'invisible';
+
+  try {
+    const verifier = await ensureRecaptchaVerifier(recaptchaContainerId, size);
+
+    let confirmationResult: ConfirmationResult;
+
+    if (
+      auth.currentUser &&
+      !auth.currentUser.phoneNumber &&
+      !options?.preferSignInWithPhoneNumber
+    ) {
+      try {
+        confirmationResult = await linkWithPhoneNumber(
+          auth.currentUser,
+          cleanPhone,
+          verifier
+        );
+      } catch (linkErr) {
+        const errCode = (linkErr as { code?: string })?.code || '';
+        // If current user already has a phone provider linked, fall back to signInWithPhoneNumber
+        if (errCode.includes('auth/provider-already-linked')) {
+          const freshVerifier = await ensureRecaptchaVerifier(
+            recaptchaContainerId,
+            size
+          );
+          confirmationResult = await signInWithPhoneNumber(
+            auth,
+            cleanPhone,
+            freshVerifier
+          );
+        } else {
+          throw linkErr;
+        }
+      }
+    } else {
+      confirmationResult = await signInWithPhoneNumber(
+        auth,
+        cleanPhone,
+        verifier
+      );
+    }
+
+    if (!confirmationResult || !confirmationResult.verificationId) {
+      throw new Error(
+        'لم يُرجع Firebase معرّف التحقق (verificationId) بعد طلب إرسال SMS.'
+      );
+    }
+
+    return confirmationResult;
+  } catch (error) {
+    // Always reset/clear reCAPTCHA whenever the SMS OTP request fails so subsequent attempts don't hang
+    resetRecaptchaVerifier(recaptchaContainerId);
+    throw error;
+  } finally {
+    isPhoneOtpRequestInFlight = false;
+  }
 }
 
 export async function confirmPhoneOtpViaFirebase(

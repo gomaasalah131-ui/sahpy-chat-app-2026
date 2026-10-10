@@ -38,6 +38,10 @@ import {
   reloadAndCheckCurrentUser,
   sendPhoneOtpViaFirebase,
   confirmPhoneOtpViaFirebase,
+  resetRecaptchaVerifier,
+  ensureRecaptchaVerifier,
+  inspectFirebasePhoneAuthEnvironment,
+  FirebasePhoneAuthDiagnostics,
   signOutFromCloud,
   checkUsernameAvailability,
   reserveUsernameAndSaveProfileToFirestore,
@@ -228,6 +232,14 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
   const [isConfirmingOtp, setIsConfirmingOtp] = useState(false);
   const [isCheckingEmail, setIsCheckingEmail] = useState(false);
   const [showFirebaseSetupHelp, setShowFirebaseSetupHelp] = useState(false);
+  const [recaptchaSize, setRecaptchaSize] = useState<'invisible' | 'normal'>(
+    'invisible'
+  );
+  const [phoneOtpError, setPhoneOtpError] = useState('');
+  const [phoneOtpRawDetail, setPhoneOtpRawDetail] = useState('');
+  const [phoneOtpSuccess, setPhoneOtpSuccess] = useState('');
+  const [phoneDiagnostics, setPhoneDiagnostics] =
+    useState<FirebasePhoneAuthDiagnostics | null>(null);
 
   // General UI Feedback
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -235,6 +247,40 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
   const [successMsg, setSuccessMsg] = useState('');
 
   const avatarFileInputRef = useRef<HTMLInputElement | null>(null);
+  const sendingOtpLockRef = useRef<boolean>(false);
+
+  // Load live Firebase Phone Auth & Authorized Domains diagnostics when entering verify tab
+  useEffect(() => {
+    if (authTab === 'verify') {
+      inspectFirebasePhoneAuthEnvironment()
+        .then((diag) => setPhoneDiagnostics(diag))
+        .catch(() => {});
+    } else {
+      resetRecaptchaVerifier('firebase-recaptcha-container');
+    }
+    return () => {
+      resetRecaptchaVerifier('firebase-recaptcha-container');
+    };
+  }, [authTab]);
+
+  // If user switches to visible 'normal' reCAPTCHA v2, pre-render the checkbox in the container
+  useEffect(() => {
+    if (authTab === 'verify' && recaptchaSize === 'normal') {
+      const timer = setTimeout(() => {
+        ensureRecaptchaVerifier('firebase-recaptcha-container', 'normal', {
+          onExpired: () => {
+            setPhoneOtpError(
+              'انتهت صلاحية تحقق reCAPTCHA v2. يرجى تحديد المربع مرة أخرى.'
+            );
+          },
+        }).catch((err) => {
+          const translated = translateFirebaseAuthError(err);
+          setPhoneOtpError(translated);
+        });
+      }, 150);
+      return () => clearTimeout(timer);
+    }
+  }, [authTab, recaptchaSize]);
 
   // Sync Firebase Auth user state into form when user changes
   useEffect(() => {
@@ -761,53 +807,99 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
   };
 
   const handleSendSmsOtp = async () => {
-    setErrorMsg('');
-    setSuccessMsg('');
-
-    const phoneCheck = isValidPhoneE164Format(countryCode, phoneDigits);
-    if (!phoneCheck.valid) {
-      setErrorMsg(
-        phoneCheck.reason ||
-          'يرجى إدخال رقم هاتف صحيح مع رمز الدولة لإرسال رسالة SMS.'
-      );
+    // Strictly prevent duplicate/concurrent OTP requests
+    if (sendingOtpLockRef.current || isSendingOtp) {
       return;
     }
 
+    setErrorMsg('');
+    setSuccessMsg('');
+    setPhoneOtpError('');
+    setPhoneOtpRawDetail('');
+    setPhoneOtpSuccess('');
+
+    const phoneCheck = isValidPhoneE164Format(countryCode, phoneDigits);
+    if (!phoneCheck.valid) {
+      const msg =
+        phoneCheck.reason ||
+        'يرجى إدخال رقم هاتف صحيح مع رمز الدولة لإرسال رسالة SMS.';
+      setErrorMsg(msg);
+      setPhoneOtpError(msg);
+      return;
+    }
+
+    sendingOtpLockRef.current = true;
     setIsSendingOtp(true);
+
     try {
       const result = await sendPhoneOtpViaFirebase(
         phoneCheck.e164,
-        'firebase-recaptcha-container'
+        'firebase-recaptcha-container',
+        { recaptchaSize }
       );
+      // Only mark OTP as sent after Firebase genuinely succeeds and returns a valid verificationId
       setConfirmationResult(result);
       setOtpSent(true);
-      setSuccessMsg(
-        `تم إرسال رمز التحقق (OTP) عبر SMS إلى الرقم ${phoneCheck.e164} بنجاح 📲 يرجى إدخال الرمز المكون من 6 أرقام.`
-      );
+      const okText = `تم إرسال رمز التحقق (OTP) فعلياً عبر Firebase SMS إلى الرقم ${phoneCheck.e164} بنجاح 📲 يرجى إدخال الرمز المكون من 6 أرقام.`;
+      setSuccessMsg(okText);
+      setPhoneOtpSuccess(okText);
     } catch (err) {
+      // Never claim OTP was sent when Firebase request fails; reset state and reCAPTCHA
+      setOtpSent(false);
+      setConfirmationResult(null);
+      resetRecaptchaVerifier('firebase-recaptcha-container');
+
+      const rawCode = (err as { code?: string })?.code || '';
+      const rawMessage =
+        err instanceof Error ? err.message : String(err || '');
       const translated = translateFirebaseAuthError(err);
+
       setErrorMsg(translated);
-      if (
-        translated.includes('Firebase Console') ||
-        translated.includes('Blaze') ||
-        translated.includes('reCAPTCHA')
-      ) {
-        setShowFirebaseSetupHelp(true);
+      setPhoneOtpError(translated);
+      setPhoneOtpRawDetail(
+        rawCode
+          ? `${rawCode}${rawMessage ? ` — ${rawMessage}` : ''}`
+          : rawMessage
+      );
+      setShowFirebaseSetupHelp(true);
+
+      // Refresh live diagnostics so user sees Authorized Domains & config status
+      inspectFirebasePhoneAuthEnvironment()
+        .then((diag) => setPhoneDiagnostics(diag))
+        .catch(() => {});
+
+      // If visible 'normal' mode was active, re-render fresh checkbox after reset
+      if (recaptchaSize === 'normal') {
+        setTimeout(() => {
+          ensureRecaptchaVerifier(
+            'firebase-recaptcha-container',
+            'normal'
+          ).catch(() => {});
+        }, 250);
       }
     } finally {
+      sendingOtpLockRef.current = false;
       setIsSendingOtp(false);
     }
   };
 
   const handleVerifySmsOtp = async () => {
+    if (isConfirmingOtp) return;
     setErrorMsg('');
     setSuccessMsg('');
+    setPhoneOtpError('');
+    setPhoneOtpSuccess('');
+
     if (!confirmationResult) {
-      setErrorMsg('يرجى الضغط على "إرسال رمز OTP عبر SMS" أولاً.');
+      const msg = 'يرجى الضغط على "إرسال رمز OTP" أولاً وانتظار نجاح الإرسال.';
+      setErrorMsg(msg);
+      setPhoneOtpError(msg);
       return;
     }
     if (!/^\d{6}$/.test(otpCode.trim())) {
-      setErrorMsg('يرجى إدخال رمز التحقق المكون من 6 أرقام بشكل صحيح.');
+      const msg = 'يرجى إدخال رمز التحقق المكون من 6 أرقام بشكل صحيح.';
+      setErrorMsg(msg);
+      setPhoneOtpError(msg);
       return;
     }
 
@@ -817,11 +909,14 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
       setIsPhoneVerified(true);
       setOtpSent(false);
       setOtpCode('');
-      setSuccessMsg(
-        'تم تأكيد رقم الهاتف فعلياً عبر Firebase Phone Authentication ✅'
-      );
+      const okText =
+        'تم تأكيد رقم الهاتف فعلياً عبر Firebase Phone Authentication ✅';
+      setSuccessMsg(okText);
+      setPhoneOtpSuccess(okText);
     } catch (err) {
-      setErrorMsg(translateFirebaseAuthError(err));
+      const translated = translateFirebaseAuthError(err);
+      setErrorMsg(translated);
+      setPhoneOtpError(translated);
     } finally {
       setIsConfirmingOtp(false);
     }
@@ -1688,12 +1783,22 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                   )}
                 </div>
 
+                {/* Step A: Email Verification */}
                 {!firebaseUser ? (
-                  <div className="p-4 rounded-2xl bg-black/60 border border-white/10 text-center space-y-3">
+                  <div className="p-4 rounded-2xl bg-black/60 border border-white/10 space-y-3">
+                    <div className="flex items-center justify-between flex-wrap gap-2">
+                      <span className="text-xs sm:text-sm font-bold text-white flex items-center gap-2">
+                        <Mail className="w-4 h-4 text-emerald-400" />
+                        <span>أولاً: حساب البريد الإلكتروني</span>
+                      </span>
+                      <span className="px-2.5 py-1 rounded-full bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[11px] font-bold">
+                        غير مسجل الدخول حالياً
+                      </span>
+                    </div>
                     <p className="text-xs text-white/70">
-                      يرجى إنشاء حساب جديد أو تسجيل الدخول أولاً للوصول إلى خطوات التحقق.
+                      يمكنك إنشاء حساب جديد أو تسجيل الدخول لتأكيد البريد الإلكتروني، أو اختبار وتأكيد رقم الهاتف عبر SMS OTP بالأسفل مباشرة:
                     </p>
-                    <div className="flex items-center justify-center gap-2">
+                    <div className="flex items-center gap-2">
                       <button
                         type="button"
                         onClick={() => setAuthTab('signup')}
@@ -1711,156 +1816,303 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                     </div>
                   </div>
                 ) : (
-                  <>
-                    {/* Step A: Email Verification */}
-                    <div className="p-4 rounded-2xl bg-black/70 border border-white/10 space-y-3">
-                      <div className="flex items-center justify-between flex-wrap gap-2">
-                        <div className="flex items-center gap-2">
-                          <Mail className="w-4 h-4 text-emerald-400" />
-                          <span className="text-xs sm:text-sm font-bold text-white">
-                            أولاً: تأكيد البريد الإلكتروني ({firebaseUser.email})
-                          </span>
-                        </div>
-                        {isEmailVerified ? (
-                          <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[11px] font-bold flex items-center gap-1">
-                            <CheckCircle2 className="w-3.5 h-3.5" />
-                            البريد مؤكد ✅
-                          </span>
-                        ) : (
-                          <span className="px-2.5 py-1 rounded-full bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[11px] font-bold">
-                            بانتظار التأكيد ⏳
-                          </span>
-                        )}
+                  <div className="p-4 rounded-2xl bg-black/70 border border-white/10 space-y-3">
+                    <div className="flex items-center justify-between flex-wrap gap-2">
+                      <div className="flex items-center gap-2">
+                        <Mail className="w-4 h-4 text-emerald-400" />
+                        <span className="text-xs sm:text-sm font-bold text-white">
+                          أولاً: تأكيد البريد الإلكتروني ({firebaseUser.email})
+                        </span>
                       </div>
-
-                      {!isEmailVerified && (
-                        <>
-                          <p className="text-xs text-white/60 leading-relaxed">
-                            قمنا بإرسال رسالة تحقق حقيقية من Firebase إلى بريدك الإلكتروني. افتح الرسالة واضغط على رابط التفعيل، ثم اضغط الزر أدناه لتحديث حالة التحقق:
-                          </p>
-                          <div className="flex flex-wrap items-center gap-2">
-                            <button
-                              type="button"
-                              disabled={isCheckingEmail}
-                              onClick={handleRefreshEmailVerificationStatus}
-                              className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
-                            >
-                              <RefreshCw
-                                className={`w-3.5 h-3.5 ${
-                                  isCheckingEmail ? 'animate-spin' : ''
-                                }`}
-                              />
-                              <span>لقد أكدت البريد — تحديث الحالة الآن</span>
-                            </button>
-
-                            <button
-                              type="button"
-                              disabled={isCheckingEmail}
-                              onClick={handleResendVerificationEmail}
-                              className="px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-white text-xs font-medium cursor-pointer disabled:opacity-50"
-                            >
-                              إعادة إرسال رابط التحقق
-                            </button>
-                          </div>
-                        </>
+                      {isEmailVerified ? (
+                        <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[11px] font-bold flex items-center gap-1">
+                          <CheckCircle2 className="w-3.5 h-3.5" />
+                          البريد مؤكد ✅
+                        </span>
+                      ) : (
+                        <span className="px-2.5 py-1 rounded-full bg-amber-500/20 border border-amber-500/40 text-amber-300 text-[11px] font-bold">
+                          بانتظار التأكيد ⏳
+                        </span>
                       )}
                     </div>
 
-                    {/* Step B: Phone OTP Verification via Firebase Phone Auth SMS */}
-                    <div className="p-4 rounded-2xl bg-black/70 border border-white/10 space-y-3">
-                      <div className="flex items-center justify-between flex-wrap gap-2">
-                        <div className="flex items-center gap-2">
-                          <Smartphone className="w-4 h-4 text-cyan-400" />
-                          <span className="text-xs sm:text-sm font-bold text-white">
-                            ثانياً: تأكيد رقم الهاتف عبر SMS OTP (Firebase Phone Auth)
-                          </span>
-                        </div>
-                        {isPhoneVerified ? (
-                          <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[11px] font-bold flex items-center gap-1">
-                            <CheckCircle2 className="w-3.5 h-3.5" />
-                            الهاتف مؤكد بـ OTP ✅
-                          </span>
-                        ) : (
-                          <span className="px-2.5 py-1 rounded-full bg-cyan-500/15 border border-cyan-500/30 text-cyan-300 text-[11px] font-bold">
-                            تحقق عبر رسالة SMS
-                          </span>
-                        )}
-                      </div>
+                    {!isEmailVerified && (
+                      <>
+                        <p className="text-xs text-white/60 leading-relaxed">
+                          قمنا بإرسال رسالة تحقق حقيقية من Firebase إلى بريدك الإلكتروني. افتح الرسالة واضغط على رابط التفعيل، ثم اضغط الزر أدناه لتحديث حالة التحقق:
+                        </p>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={isCheckingEmail}
+                            onClick={handleRefreshEmailVerificationStatus}
+                            className="px-4 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                          >
+                            <RefreshCw
+                              className={`w-3.5 h-3.5 ${
+                                isCheckingEmail ? 'animate-spin' : ''
+                              }`}
+                            />
+                            <span>لقد أكدت البريد — تحديث الحالة الآن</span>
+                          </button>
 
-                      <div className="flex items-center gap-2" dir="ltr">
-                        <select
-                          value={countryCode}
-                          onChange={(e) => setCountryCode(e.target.value)}
-                          className="bg-brand-gray border border-white/15 rounded-xl h-10 px-2 text-white text-xs font-mono"
+                          <button
+                            type="button"
+                            disabled={isCheckingEmail}
+                            onClick={handleResendVerificationEmail}
+                            className="px-3.5 py-2 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-white text-xs font-medium cursor-pointer disabled:opacity-50"
+                          >
+                            إعادة إرسال رابط التحقق
+                          </button>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {/* Step B: Phone OTP Verification via Firebase Phone Auth SMS */}
+                <div className="p-4 rounded-2xl bg-black/70 border border-white/10 space-y-3">
+                  <div className="flex items-center justify-between flex-wrap gap-2">
+                    <div className="flex items-center gap-2">
+                      <Smartphone className="w-4 h-4 text-cyan-400" />
+                      <span className="text-xs sm:text-sm font-bold text-white">
+                        ثانياً: تأكيد رقم الهاتف عبر SMS OTP (Firebase Phone Auth)
+                      </span>
+                    </div>
+                    {isPhoneVerified ? (
+                      <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[11px] font-bold flex items-center gap-1">
+                        <CheckCircle2 className="w-3.5 h-3.5" />
+                        الهاتف مؤكد بـ OTP ✅
+                      </span>
+                    ) : (
+                      <span className="px-2.5 py-1 rounded-full bg-cyan-500/15 border border-cyan-500/30 text-cyan-300 text-[11px] font-bold">
+                        تحقق عبر رسالة SMS
+                      </span>
+                    )}
+                  </div>
+
+                  {/* reCAPTCHA v2 Mode Selector & Manual Reset */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] bg-white/5 px-3 py-2 rounded-xl border border-white/10">
+                    <div className="flex items-center gap-2 text-white/75">
+                      <span>وضع التحقق الأمني (reCAPTCHA v2):</span>
+                      <button
+                        type="button"
+                        disabled={isSendingOtp}
+                        onClick={() => {
+                          setRecaptchaSize('invisible');
+                          resetRecaptchaVerifier('firebase-recaptcha-container');
+                        }}
+                        className={`px-2 py-0.5 rounded-lg font-bold cursor-pointer transition-all ${
+                          recaptchaSize === 'invisible'
+                            ? 'bg-cyan-500 text-slate-950'
+                            : 'bg-black/60 text-white/60 hover:text-white'
+                        }`}
+                      >
+                        تلقائي (Invisible v2)
+                      </button>
+                      <button
+                        type="button"
+                        disabled={isSendingOtp}
+                        onClick={() => {
+                          setRecaptchaSize('normal');
+                          resetRecaptchaVerifier('firebase-recaptcha-container');
+                        }}
+                        className={`px-2 py-0.5 rounded-lg font-bold cursor-pointer transition-all ${
+                          recaptchaSize === 'normal'
+                            ? 'bg-cyan-500 text-slate-950'
+                            : 'bg-black/60 text-white/60 hover:text-white'
+                        }`}
+                      >
+                        مرئي (مربع اختيار v2)
+                      </button>
+                    </div>
+
+                    <button
+                      type="button"
+                      disabled={isSendingOtp}
+                      onClick={() => {
+                        resetRecaptchaVerifier('firebase-recaptcha-container');
+                        setPhoneOtpError('');
+                        setPhoneOtpRawDetail('');
+                        if (recaptchaSize === 'normal') {
+                          setTimeout(() => {
+                            ensureRecaptchaVerifier(
+                              'firebase-recaptcha-container',
+                              'normal'
+                            ).catch(() => {});
+                          }, 100);
+                        }
+                      }}
+                      className="text-cyan-300 hover:underline flex items-center gap-1 cursor-pointer"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      <span>إعادة ضبط reCAPTCHA</span>
+                    </button>
+                  </div>
+
+                  <div className="flex items-center gap-2" dir="ltr">
+                    <select
+                      value={countryCode}
+                      onChange={(e) => setCountryCode(e.target.value)}
+                      className="bg-brand-gray border border-white/15 rounded-xl h-10 px-2 text-white text-xs font-mono"
+                    >
+                      {COUNTRY_CODES.map((c) => (
+                        <option
+                          key={c.code}
+                          value={c.code}
+                          className="bg-slate-900"
                         >
-                          {COUNTRY_CODES.map((c) => (
-                            <option
-                              key={c.code}
-                              value={c.code}
-                              className="bg-slate-900"
-                            >
-                              {c.label}
-                            </option>
-                          ))}
-                        </select>
-                        <input
+                          {c.label}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      dir="ltr"
+                      type="tel"
+                      value={phoneDigits}
+                      onChange={(e) => setPhoneDigits(e.target.value)}
+                      placeholder="1098765432"
+                      className="flex-1 bg-brand-gray border border-white/15 rounded-xl h-10 px-3 text-white text-xs font-mono"
+                    />
+                    <button
+                      type="button"
+                      disabled={isSendingOtp}
+                      onClick={handleSendSmsOtp}
+                      className="px-3.5 h-10 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs shrink-0 cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
+                    >
+                      {isSendingOtp && (
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      )}
+                      <span>
+                        {isSendingOtp
+                          ? 'جاري الإرسال...'
+                          : otpSent
+                          ? 'إعادة إرسال SMS'
+                          : 'إرسال رمز OTP'}
+                      </span>
+                    </button>
+                  </div>
+
+                  {/* Real Firebase Recaptcha Container */}
+                  <div
+                    id="firebase-recaptcha-container"
+                    className="flex justify-center overflow-x-auto py-1 min-h-[4px]"
+                  />
+
+                  {/* Inline Real Error & Status Feedback right next to the SMS button */}
+                  {phoneOtpError && (
+                    <div
+                      dir="rtl"
+                      className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/40 text-xs text-rose-200 space-y-1.5 leading-relaxed"
+                    >
+                      <div className="flex items-start gap-2 font-bold text-rose-300">
+                        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                        <span>فشل إرسال رسالة SMS من Firebase:</span>
+                      </div>
+                      <p className="text-rose-100">{phoneOtpError}</p>
+                      {phoneOtpRawDetail && (
+                        <p
                           dir="ltr"
-                          type="tel"
-                          value={phoneDigits}
-                          onChange={(e) => setPhoneDigits(e.target.value)}
-                          placeholder="1098765432"
-                          className="flex-1 bg-brand-gray border border-white/15 rounded-xl h-10 px-3 text-white text-xs font-mono"
+                          className="text-[11px] font-mono bg-black/50 px-2.5 py-1.5 rounded-lg text-rose-300 border border-rose-500/20 break-all"
+                        >
+                          Firebase SDK Error: {phoneOtpRawDetail}
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  {phoneOtpSuccess && (
+                    <div
+                      dir="rtl"
+                      className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/40 text-xs text-emerald-200 flex items-start gap-2 leading-relaxed"
+                    >
+                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                      <span>{phoneOtpSuccess}</span>
+                    </div>
+                  )}
+
+                  {/* Live Firebase Phone Auth & Authorized Domains Diagnostic Box */}
+                  {phoneDiagnostics && (
+                    <div
+                      dir="rtl"
+                      className="p-3 rounded-xl bg-white/5 border border-white/10 text-[11px] text-white/75 space-y-1.5 leading-relaxed"
+                    >
+                      <div className="flex items-center justify-between flex-wrap gap-1 font-bold text-cyan-300">
+                        <span>فحص إعدادات Firebase Phone Auth & Authorized Domains:</span>
+                        <span
+                          dir="ltr"
+                          className={`px-2 py-0.5 rounded text-[10px] font-mono ${
+                            phoneDiagnostics.isCurrentDomainAuthorized
+                              ? 'bg-emerald-500/20 text-emerald-300'
+                              : 'bg-rose-500/20 text-rose-300'
+                          }`}
+                        >
+                          {phoneDiagnostics.currentHostname}:{' '}
+                          {phoneDiagnostics.isCurrentDomainAuthorized
+                            ? 'Authorized ✓'
+                            : 'NOT in Authorized Domains ✗'}
+                        </span>
+                      </div>
+                      <p className="text-white/65">
+                        • <strong>بخصوص رسالة reCAPTCHA Enterprise:</strong> ظهور الرسالة{' '}
+                        <code dir="ltr" className="text-amber-300 font-mono">
+                          Failed to initialize reCAPTCHA Enterprise config. Triggering the reCAPTCHA v2 verification.
+                        </code>{' '}
+                        هو سلوك طبيعي من مكتبة Firebase لأن المشروع يستخدم{' '}
+                        <strong>reCAPTCHA v2</strong> المجاني بدلاً من Enterprise، ولا يمنع الإرسال بحد ذاته.
+                      </p>
+                      {!phoneDiagnostics.isCurrentDomainAuthorized && (
+                        <p className="text-rose-300 font-bold">
+                          • تنبيه النطاق: النطاق الحالي ({phoneDiagnostics.currentHostname}) غير مضاف في Authorized domains. يرجى إضافته من Firebase Console &gt; Authentication &gt; Settings &gt; Authorized domains.
+                        </p>
+                      )}
+                      <p className="text-white/65">
+                        • <strong>لتفعيل إرسال SMS في Firebase Console:</strong> تأكد من تفعيل مزود{' '}
+                        <strong>Phone</strong> في{' '}
+                        <span dir="ltr" className="font-mono text-cyan-300">
+                          Authentication &gt; Sign-in method
+                        </span>
+                        ، وإما تفعيل خطة Blaze للرسائل الحقيقية أو إضافة رقمك في{' '}
+                        <span dir="ltr" className="font-mono text-cyan-300">
+                          Phone numbers for testing
+                        </span>
+                        .
+                      </p>
+                    </div>
+                  )}
+
+                  {otpSent && confirmationResult && (
+                    <div className="pt-2 space-y-2.5 border-t border-white/10">
+                      <label className="block text-xs text-emerald-300 font-bold">
+                        أدخل رمز التحقق المكون من 6 أرقام المرسل عبر SMS:
+                      </label>
+                      <div className="flex items-center gap-2" dir="ltr">
+                        <input
+                          type="text"
+                          maxLength={6}
+                          value={otpCode}
+                          onChange={(e) =>
+                            setOtpCode(e.target.value.replace(/\D/g, ''))
+                          }
+                          placeholder="123456"
+                          className="flex-1 bg-black border border-emerald-500/50 rounded-xl h-11 px-4 text-center text-base font-bold tracking-[0.4em] text-white font-mono focus:outline-none"
                         />
                         <button
                           type="button"
-                          disabled={isSendingOtp}
-                          onClick={handleSendSmsOtp}
-                          className="px-3.5 h-10 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs shrink-0 cursor-pointer disabled:opacity-50"
+                          disabled={isConfirmingOtp}
+                          onClick={handleVerifySmsOtp}
+                          className="px-5 h-11 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs cursor-pointer disabled:opacity-50"
                         >
-                          {isSendingOtp
-                            ? 'جاري الإرسال...'
-                            : otpSent
-                            ? 'إعادة إرسال SMS'
-                            : 'إرسال رمز OTP'}
+                          {isConfirmingOtp ? 'جاري التأكيد...' : 'تأكيد الرمز'}
                         </button>
                       </div>
-
-                      {/* Real Firebase Recaptcha Container */}
-                      <div
-                        id="firebase-recaptcha-container"
-                        className="flex justify-center overflow-x-auto py-1"
-                      />
-
-                      {otpSent && (
-                        <div className="pt-2 space-y-2.5 border-t border-white/10">
-                          <label className="block text-xs text-emerald-300 font-bold">
-                            أدخل رمز التحقق المكون من 6 أرقام المرسل عبر SMS:
-                          </label>
-                          <div className="flex items-center gap-2" dir="ltr">
-                            <input
-                              type="text"
-                              maxLength={6}
-                              value={otpCode}
-                              onChange={(e) =>
-                                setOtpCode(e.target.value.replace(/\D/g, ''))
-                              }
-                              placeholder="123456"
-                              className="flex-1 bg-black border border-emerald-500/50 rounded-xl h-11 px-4 text-center text-base font-bold tracking-[0.4em] text-white font-mono focus:outline-none"
-                            />
-                            <button
-                              type="button"
-                              disabled={isConfirmingOtp}
-                              onClick={handleVerifySmsOtp}
-                              className="px-5 h-11 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs cursor-pointer disabled:opacity-50"
-                            >
-                              {isConfirmingOtp ? 'جاري التأكيد...' : 'تأكيد الرمز'}
-                            </button>
-                          </div>
-                        </div>
-                      )}
                     </div>
+                  )}
+                </div>
 
-                    {/* Step C: Confirm Full Name & Unique @username in Firestore */}
+                {/* Step C: Confirm Full Name & Unique @username in Firestore */}
+                {firebaseUser && (
+                  <>
                     <div className="p-4 rounded-2xl bg-black/70 border border-white/10 space-y-3">
                       <span className="text-xs sm:text-sm font-bold text-white block">
                         ثالثاً: تثبيت الاسم واسم المستخدم الفريد (@username) في Firestore
