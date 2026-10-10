@@ -83,6 +83,7 @@ import {
   findRegisteredUserInFirestore,
   ensureAuthorizedChatRoomInFirestore,
   sendDirectMessageToAuthorizedChat,
+  subscribeToAuthorizedChatRooms,
   subscribeToAuthorizedChatMessages,
   getDeterministicChatId,
   PublicDirectoryUser,
@@ -430,7 +431,7 @@ export default function App() {
 
   // Current User Profile State
   const [currentUserUid, setCurrentUserUid] = useState<string>(
-    () => localStorage.getItem('nabd_user_uid') || ''
+    () => (auth.currentUser?.emailVerified ? auth.currentUser.uid : '')
   );
   const [userName, setUserName] = useState(() => {
     const raw = localStorage.getItem('nabd_user_name') || '𝔼𝕟𝕘𝕚𝕟𝕖𝕖𝕣 𝕊𝔸𝕃𝔸ℍ 𝔾𝕆𝕄𝔸𝔸';
@@ -736,9 +737,10 @@ export default function App() {
           if (profile.bio) setUserBio(profile.bio);
           setFirestoreConnected(true);
         }
-      } else if (!fbUser) {
+      } else {
         setCurrentUserUid('');
         localStorage.removeItem('nabd_user_uid');
+        setViewMode('registration');
       }
     });
     return () => unsubAuth();
@@ -1061,6 +1063,68 @@ export default function App() {
 
     return () => unsub();
   }, [currentUserUid, selectedContact?.id, selectedContact?.uid, selectedContact?.chatId, selectedContact?.isGroup]);
+
+  // Subscribe to all authorized Firestore 1-on-1 chat rooms where current user is a participant
+  useEffect(() => {
+    const myUid = currentUserUid || auth.currentUser?.uid || '';
+    if (!myUid || !auth.currentUser?.emailVerified) return;
+
+    const unsubRooms = subscribeToAuthorizedChatRooms(myUid, (rooms) => {
+      setFirestoreConnected(true);
+      if (rooms.length === 0) return;
+      setContacts((prev) => {
+        const next = [...prev];
+        let changed = false;
+        for (const room of rooms) {
+          if (!room.otherUid || room.otherUid === myUid) continue;
+          const existingIdx = next.findIndex(
+            (c) => c.uid === room.otherUid || c.id === room.otherUid
+          );
+          if (existingIdx === -1) {
+            changed = true;
+            next.unshift({
+              id: room.otherUid,
+              uid: room.otherUid,
+              chatId: room.chatId,
+              name:
+                room.otherName ||
+                (room.otherUsername ? `@${room.otherUsername}` : 'مستخدم مسجل'),
+              phone: room.otherUsername ? `@${room.otherUsername}` : room.otherUid,
+              username: room.otherUsername || undefined,
+              avatar: omarAvatar,
+              roleOrBio: 'مستخدم مسجل وموثّق في SAHPY-CHAT ✨',
+              isOnline: true,
+              lastSeen: 'متصل الآن',
+              unreadCount: 0,
+              isPinned: false,
+              isMuted: false,
+              isBlocked: false,
+              customWallpaper: 'aurora-borealis',
+              sharedMedia: [],
+              messages: room.lastMessageText
+                ? [
+                    {
+                      id: `room-last-${room.chatId}`,
+                      senderId: room.otherUid,
+                      senderUid: room.otherUid,
+                      senderName: room.otherName,
+                      text: room.lastMessageText,
+                      timestamp: room.lastMessageTime || 'الآن',
+                      status: 'read',
+                      type: 'text',
+                      reactions: [],
+                    },
+                  ]
+                : [],
+            });
+          }
+        }
+        return changed ? next : prev;
+      });
+    });
+
+    return () => unsubRooms();
+  }, [currentUserUid]);
 
   // Reset groupSenderMemberId when switching contacts
   useEffect(() => {
@@ -1607,8 +1671,8 @@ export default function App() {
     if (!inputText.trim() || !selectedContact || selectedContact.isBlocked) return;
 
     const myUid = currentUserUid || auth.currentUser?.uid || '';
-    if (!myUid && !auth.currentUser) {
-      triggerToast('يجب تسجيل الدخول وتأكيد هويتك أولاً قبل إرسال الرسائل.');
+    if (!myUid || !auth.currentUser || !auth.currentUser.emailVerified) {
+      triggerToast('يجب تسجيل الدخول وتأكيد بريدك الإلكتروني أولاً قبل إرسال الرسائل 🔒');
       setViewMode('registration');
       return;
     }
@@ -1693,11 +1757,20 @@ export default function App() {
       type: 'text',
     });
 
-    if (!isGroupChat && myUid && selectedContact.uid && myUid !== selectedContact.uid) {
+    const recipientUid =
+      selectedContact.uid ||
+      (!isGroupChat && !DEMO_CONTACT_IDS.has(selectedContact.id)
+        ? selectedContact.id
+        : '');
+
+    if (!isGroupChat && myUid && recipientUid && myUid !== recipientUid) {
       sendDirectMessageToAuthorizedChat({
         senderUid: myUid,
-        recipientUid: selectedContact.uid,
+        recipientUid,
         senderName: effectiveSenderName,
+        senderUsername: userUsername,
+        recipientName: selectedContact.name,
+        recipientUsername: selectedContact.username,
         text: newMsg.text,
         type: 'text',
       }).catch(() => {});
@@ -1711,8 +1784,8 @@ export default function App() {
     if (!selectedContact || selectedContact.isBlocked) return;
 
     const myUid = currentUserUid || auth.currentUser?.uid || '';
-    if (!myUid && !auth.currentUser) {
-      triggerToast('يجب تسجيل الدخول وتأكيد هويتك أولاً قبل إرسال الملصقات.');
+    if (!myUid || !auth.currentUser || !auth.currentUser.emailVerified) {
+      triggerToast('يجب تسجيل الدخول وتأكيد بريدك الإلكتروني أولاً قبل إرسال الملصقات 🔒');
       setViewMode('registration');
       return;
     }
@@ -1810,11 +1883,20 @@ export default function App() {
       type: 'sticker',
     });
 
-    if (!isGroupChat && myUid && selectedContact.uid && myUid !== selectedContact.uid) {
+    const recipientUid =
+      selectedContact.uid ||
+      (!isGroupChat && !DEMO_CONTACT_IDS.has(selectedContact.id)
+        ? selectedContact.id
+        : '');
+
+    if (!isGroupChat && myUid && recipientUid && myUid !== recipientUid) {
       sendDirectMessageToAuthorizedChat({
         senderUid: myUid,
-        recipientUid: selectedContact.uid,
+        recipientUid,
         senderName: effectiveSenderName,
+        senderUsername: userUsername,
+        recipientName: selectedContact.name,
+        recipientUsername: selectedContact.username,
         text: stickerSummaryText,
         type: 'sticker',
       }).catch(() => {});
@@ -1826,6 +1908,13 @@ export default function App() {
   // Send Voice Note (Synced in real-time with friends!)
   const handleFinishVoiceNote = () => {
     if (!selectedContact || selectedContact.isBlocked) return;
+    const myUid = currentUserUid || auth.currentUser?.uid || '';
+    if (!myUid || !auth.currentUser || !auth.currentUser.emailVerified) {
+      setIsRecordingVoice(false);
+      triggerToast('يجب تسجيل الدخول وتأكيد بريدك الإلكتروني أولاً قبل إرسال الرسائل الصوتية 🔒');
+      setViewMode('registration');
+      return;
+    }
     const durMin = Math.floor(recordingSeconds / 60);
     const durSec = (recordingSeconds % 60).toString().padStart(2, '0');
     const durationStr = `${durMin}:${durSec === '00' ? '04' : durSec}`;
@@ -1877,12 +1966,36 @@ export default function App() {
       }),
     }).catch(() => {});
 
+    const recipientUid =
+      selectedContact.uid ||
+      (!isGroupChat && !DEMO_CONTACT_IDS.has(selectedContact.id)
+        ? selectedContact.id
+        : '');
+    if (!isGroupChat && myUid && recipientUid && myUid !== recipientUid) {
+      sendDirectMessageToAuthorizedChat({
+        senderUid: myUid,
+        recipientUid,
+        senderName: userName,
+        senderUsername: userUsername,
+        recipientName: selectedContact.name,
+        recipientUsername: selectedContact.username,
+        text: '🎤 رسالة صوتية',
+        type: 'voice',
+      }).catch(() => {});
+    }
+
     simulateMessageLifecycle(targetId, newMsgId);
   };
 
   // Send Image Attachment (Synced in real-time with friends!)
   const handleSendSampleImage = (customUrl?: string, customTitle?: string) => {
     if (!selectedContact || selectedContact.isBlocked) return;
+    const myUid = currentUserUid || auth.currentUser?.uid || '';
+    if (!myUid || !auth.currentUser || !auth.currentUser.emailVerified) {
+      triggerToast('يجب تسجيل الدخول وتأكيد بريدك الإلكتروني أولاً قبل إرسال الصور 🔒');
+      setViewMode('registration');
+      return;
+    }
     const randomImg =
       customUrl ||
       SAMPLE_SHARED_IMAGES[
@@ -1954,6 +2067,24 @@ export default function App() {
         imageCaption: captionText,
       }),
     }).catch(() => {});
+
+    const recipientUid =
+      selectedContact.uid ||
+      (!isGroupChat && !DEMO_CONTACT_IDS.has(selectedContact.id)
+        ? selectedContact.id
+        : '');
+    if (!isGroupChat && myUid && recipientUid && myUid !== recipientUid) {
+      sendDirectMessageToAuthorizedChat({
+        senderUid: myUid,
+        recipientUid,
+        senderName: userName,
+        senderUsername: userUsername,
+        recipientName: selectedContact.name,
+        recipientUsername: selectedContact.username,
+        text: captionText,
+        type: 'image',
+      }).catch(() => {});
+    }
 
     simulateMessageLifecycle(targetId, newMsgId);
   };
@@ -2541,12 +2672,17 @@ export default function App() {
       )
     : [];
 
-  // Show Aurora Sign Up Screen if viewMode === 'registration'
-  if (viewMode === 'registration') {
-    const canEnterProtectedChats = Boolean(
-      (currentUserUid || auth.currentUser?.uid) &&
-        (auth.currentUser ? auth.currentUser.emailVerified : true)
-    );
+  // Strict authentication & email verification gate:
+  // Users cannot enter or view the chat workspace unless authenticated with a verified email in Firebase Auth.
+  const canEnterProtectedChats = Boolean(
+    auth.currentUser &&
+      auth.currentUser.uid &&
+      auth.currentUser.emailVerified &&
+      currentUserUid
+  );
+
+  // Show Aurora Sign Up Screen if viewMode === 'registration' or user is not yet authenticated & verified
+  if (viewMode === 'registration' || !canEnterProtectedChats) {
     return (
       <PhoneRegistrationScreen
         wallpaperConfig={wallpaperConfig}

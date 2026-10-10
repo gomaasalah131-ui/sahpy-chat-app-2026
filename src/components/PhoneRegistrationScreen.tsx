@@ -44,6 +44,9 @@ import {
   getOwnUserProfileFromFirestore,
   sanitizeUsername,
   isValidEmailFormat,
+  validateEmailWithArabicReason,
+  cacheUsernameEmailMapping,
+  getCachedEmailForUsername,
   isValidUsernameFormat,
   isValidPhoneE164Format,
   translateFirebaseAuthError,
@@ -173,13 +176,19 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
     firebaseUser && !isAccountFullyVerified ? 'verify' : 'login'
   );
 
-  // Registration & Profile State
-  const [fullName, setFullName] = useState(currentName || '');
-  const [username, setUsername] = useState(currentUsername || '');
+  // Registration & Profile State (starts clean unless user is already authenticated)
+  const [fullName, setFullName] = useState(
+    firebaseUser ? currentName || firebaseUser.displayName || '' : ''
+  );
+  const [username, setUsername] = useState(
+    firebaseUser ? currentUsername || '' : ''
+  );
   const [email, setEmail] = useState(firebaseUser?.email || '');
   const [countryCode, setCountryCode] = useState('+20');
   const [phoneDigits, setPhoneDigits] = useState(
-    (currentPhone || '').replace(/^\+\d+\s*/, '').replace(/\D/g, '')
+    firebaseUser
+      ? (currentPhone || '').replace(/^\+\d+\s*/, '').replace(/\D/g, '')
+      : ''
   );
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
@@ -240,6 +249,23 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
       }
       if (firebaseUser.phoneNumber) {
         setIsPhoneVerified(true);
+      }
+      // Restore pending signup profile if present
+      try {
+        const pendingRaw =
+          localStorage.getItem(`sahpy_pending_profile_${firebaseUser.uid}`) ||
+          sessionStorage.getItem(`sahpy_pending_profile_${firebaseUser.uid}`);
+        if (pendingRaw) {
+          const pending = JSON.parse(pendingRaw);
+          if (pending.fullName) setFullName(pending.fullName);
+          if (pending.username) setUsername(pending.username);
+          if (pending.email) setEmail(pending.email);
+          if (pending.phoneDigits) setPhoneDigits(pending.phoneDigits);
+          if (pending.countryCode) setCountryCode(pending.countryCode);
+          if (pending.avatarUrl) setAvatarUrl(pending.avatarUrl);
+        }
+      } catch {
+        // ignore parse errors
       }
       // Load existing Firestore profile if available
       getOwnUserProfileFromFirestore(firebaseUser.uid)
@@ -347,9 +373,11 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
     }
 
     const cleanEmail = email.trim().toLowerCase();
-    if (!isValidEmailFormat(cleanEmail)) {
+    const emailValidation = validateEmailWithArabicReason(cleanEmail);
+    if (!emailValidation.valid) {
       setErrorMsg(
-        'صيغة البريد الإلكتروني غير صحيحة. يرجى إدخال بريد إلكتروني صالح (مثل name@gmail.com).'
+        emailValidation.reason ||
+          'صيغة البريد الإلكتروني غير صحيحة. يرجى إدخال بريد إلكتروني صالح (مثل name@gmail.com).'
       );
       return;
     }
@@ -413,22 +441,47 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
         return;
       }
 
-      // Store pending profile info in sessionStorage until email & phone verification finish
+      // Store pending profile info in both localStorage and sessionStorage until email & phone verification finish
+      const pendingPayload = JSON.stringify({
+        fullName: cleanName,
+        username: cleanUsername,
+        email: cleanEmail,
+        phoneE164: phoneCheck.e164,
+        countryCode,
+        phoneDigits,
+        avatarUrl,
+      });
       sessionStorage.setItem(
         `sahpy_pending_profile_${createdUser.uid}`,
-        JSON.stringify({
-          fullName: cleanName,
+        pendingPayload
+      );
+      localStorage.setItem(
+        `sahpy_pending_profile_${createdUser.uid}`,
+        pendingPayload
+      );
+      cacheUsernameEmailMapping(cleanUsername, cleanEmail);
+
+      // Register pending reservation on backend directory so username cannot be taken while verifying email
+      fetch('/api/auth/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          uid: createdUser.uid,
+          name: cleanName,
+          phone: phoneCheck.e164,
           username: cleanUsername,
           email: cleanEmail,
-          phoneE164: phoneCheck.e164,
-          avatarUrl,
-        })
-      );
+          bio: `حساب على SAHPY-CHAT • @${cleanUsername} ✨`,
+          avatar: avatarUrl,
+          emailVerified: false,
+          phoneVerified: false,
+        }),
+      }).catch(() => {});
 
       setIsEmailVerified(Boolean(createdUser.emailVerified));
       setAuthTab('verify');
       setSuccessMsg(
-        `تم إنشاء الحساب في Firebase Authentication وإرسال رابط التحقق الفعلي إلى (${cleanEmail}) 📩 يرجى فتح بريدك الإلكتروني لتأكيده، وتأكيد رقم الهاتف عبر OTP لإتمام التفعيل.`
+        `تم إنشاء الحساب في Firebase Authentication وإرسال رابط التحقق الفعلي إلى (${cleanEmail}) 📩 يرجى فتح بريدك الإلكتروني والضغط على رابط التأكيد قبل الدخول إلى المحادثات.`
       );
     } catch (err) {
       const translated = translateFirebaseAuthError(err);
@@ -473,14 +526,28 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
           setIsSubmitting(false);
           return;
         }
-        const res = await fetch(
-          `/api/auth/resolve-username?username=${encodeURIComponent(cleanUname)}`
-        );
-        if (!res.ok) {
-          throw new Error('USERNAME_NOT_FOUND');
+        const cachedEmail = getCachedEmailForUsername(cleanUname);
+        if (cachedEmail) {
+          targetEmail = cachedEmail;
+        } else {
+          const res = await fetch(
+            `/api/auth/resolve-username?username=${encodeURIComponent(cleanUname)}`
+          );
+          if (!res.ok) {
+            throw new Error('USERNAME_NOT_FOUND');
+          }
+          const resolved = await res.json();
+          targetEmail = String(resolved.email || '').trim().toLowerCase();
         }
-        const resolved = await res.json();
-        targetEmail = String(resolved.email || '').trim().toLowerCase();
+      } else {
+        const emailCheck = validateEmailWithArabicReason(targetEmail);
+        if (!emailCheck.valid) {
+          setErrorMsg(
+            emailCheck.reason || 'صيغة البريد الإلكتروني غير صحيحة.'
+          );
+          setIsSubmitting(false);
+          return;
+        }
       }
 
       const loggedInUser = await loginWithEmailAndPasswordCloud(
@@ -488,25 +555,77 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
         loginPassword
       );
       await loggedInUser.reload();
+      await loggedInUser.getIdToken(true);
 
-      const existingProfile = await getOwnUserProfileFromFirestore(
+      if (!loggedInUser.emailVerified) {
+        setIsEmailVerified(false);
+        setAuthTab('verify');
+        setErrorMsg(
+          'حسابك مسجل ولكن لم يتم تأكيد البريد الإلكتروني بعد. يُمنع الدخول إلى الشات أو إرسال الرسائل قبل تأكيد البريد الإلكتروني عبر الرابط المرسل لبريدك.'
+        );
+        return;
+      }
+
+      setIsEmailVerified(true);
+
+      let existingProfile = await getOwnUserProfileFromFirestore(
         loggedInUser.uid
       );
+
+      // If the user just verified their email and is logging in for the first time,
+      // finalize their pending profile in Firestore automatically if available!
+      if (!existingProfile) {
+        try {
+          const pendingRaw =
+            localStorage.getItem(`sahpy_pending_profile_${loggedInUser.uid}`) ||
+            sessionStorage.getItem(`sahpy_pending_profile_${loggedInUser.uid}`);
+          const pending = pendingRaw ? JSON.parse(pendingRaw) : null;
+          const candidateName =
+            pending?.fullName ||
+            fullName.trim() ||
+            loggedInUser.displayName ||
+            '';
+          const candidateUsername = sanitizeUsername(
+            pending?.username || username || ''
+          );
+          const candidatePhone =
+            pending?.phoneE164 ||
+            loggedInUser.phoneNumber ||
+            '+201000000000';
+
+          if (
+            candidateName.length >= 3 &&
+            isValidUsernameFormat(candidateUsername)
+          ) {
+            existingProfile = await reserveUsernameAndSaveProfileToFirestore({
+              user: loggedInUser,
+              displayName: candidateName,
+              username: candidateUsername,
+              email: loggedInUser.email || targetEmail,
+              phoneTag: candidatePhone,
+              bio:
+                currentBio ||
+                `حساب موثق على SAHPY-CHAT • @${candidateUsername} ✨`,
+              wallpaperTheme: 'aurora-borealis',
+              phoneVerified: Boolean(
+                isPhoneVerified || loggedInUser.phoneNumber
+              ),
+            });
+          }
+        } catch {
+          // If username was taken in the meantime, user will complete it on the verify tab
+        }
+      }
 
       if (existingProfile) {
         setFullName(existingProfile.displayName);
         setUsername(existingProfile.username);
         setEmail(existingProfile.email);
         setIsPhoneVerified(existingProfile.phoneVerified);
-      }
-
-      if (!loggedInUser.emailVerified) {
-        setIsEmailVerified(false);
-        setAuthTab('verify');
-        setErrorMsg(
-          'حسابك مسجل ولكن لم يتم تأكيد البريد الإلكتروني بعد. يرجى تأكيد بريدك الإلكتروني أولاً للدخول إلى المحادثات.'
+        cacheUsernameEmailMapping(
+          existingProfile.username,
+          loggedInUser.email || existingProfile.email
         );
-        return;
       }
 
       // If user has a verified email and existing profile in Firestore, complete login
@@ -529,7 +648,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
         // Direct to verification / profile completion step
         setAuthTab('verify');
         setSuccessMsg(
-          'تم تسجيل الدخول بنجاح ✅ يرجى استكمال تأكيد بيانات حسابك واسم المستخدم الفريد.'
+          'تم تسجيل الدخول وتأكيد بريدك بنجاح ✅ يرجى تثبيت اسم المستخدم الفريد (@username) لحفظ حسابك في Firestore والدخول إلى المحادثات.'
         );
       }
     } catch (err) {

@@ -137,8 +137,80 @@ export function sanitizePhoneTag(rawPhone: string): string {
 }
 
 export function isValidEmailFormat(email: string): boolean {
-  const trimmed = String(email || '').trim();
-  return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(trimmed) && trimmed.length <= 120;
+  const trimmed = String(email || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(trimmed) || trimmed.length > 120) {
+    return false;
+  }
+  const domain = trimmed.split('@')[1] || '';
+  const typoDomains = new Set([
+    'gmai.com',
+    'gmial.com',
+    'gamil.com',
+    'gmail.co',
+    'yaho.com',
+    'hotmial.com',
+    'outlok.com',
+  ]);
+  if (typoDomains.has(domain)) {
+    return false;
+  }
+  return true;
+}
+
+export function validateEmailWithArabicReason(email: string): {
+  valid: boolean;
+  reason?: string;
+} {
+  const trimmed = String(email || '').trim().toLowerCase();
+  if (!trimmed) {
+    return { valid: false, reason: 'يرجى إدخال البريد الإلكتروني.' };
+  }
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(trimmed) || trimmed.length > 120) {
+    return {
+      valid: false,
+      reason:
+        'صيغة البريد الإلكتروني غير صحيحة. يرجى كتابة بريد إلكتروني صالح (مثل example@gmail.com).',
+    };
+  }
+  const domain = trimmed.split('@')[1] || '';
+  const typoSuggestions: Record<string, string> = {
+    'gmai.com': 'gmail.com',
+    'gmial.com': 'gmail.com',
+    'gamil.com': 'gmail.com',
+    'gmail.co': 'gmail.com',
+    'yaho.com': 'yahoo.com',
+    'hotmial.com': 'hotmail.com',
+    'outlok.com': 'outlook.com',
+  };
+  if (typoSuggestions[domain]) {
+    return {
+      valid: false,
+      reason: `يبدو أن هناك خطأ إملائياً في نطاق البريد (${domain}). هل تقصد @${typoSuggestions[domain]}؟`,
+    };
+  }
+  return { valid: true };
+}
+
+export function cacheUsernameEmailMapping(username: string, email: string): void {
+  try {
+    const cleanUser = sanitizeUsername(username);
+    const cleanEmail = String(email || '').trim().toLowerCase();
+    if (cleanUser && isValidEmailFormat(cleanEmail)) {
+      localStorage.setItem(`sahpy_uname_email_${cleanUser}`, cleanEmail);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function getCachedEmailForUsername(username: string): string | null {
+  try {
+    const cleanUser = sanitizeUsername(username);
+    if (!cleanUser) return null;
+    return localStorage.getItem(`sahpy_uname_email_${cleanUser}`);
+  } catch {
+    return null;
+  }
 }
 
 export function isValidUsernameFormat(username: string): boolean {
@@ -510,6 +582,8 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
   const userRef = doc(db, 'users', uid);
   const dirRef = doc(db, 'directory', uid);
 
+  let resolvedUsername = cleanUsername;
+
   try {
     await runTransaction(db, async (transaction) => {
       const usernameSnap = await transaction.get(usernameRef);
@@ -527,6 +601,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
       const effectiveUsername = userSnap.exists()
         ? String(userSnap.data().username || cleanUsername)
         : cleanUsername;
+      resolvedUsername = effectiveUsername;
 
       const effectiveUsernameRef = doc(db, 'usernames', effectiveUsername);
 
@@ -605,10 +680,12 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
     handleFirestoreError(error, OperationType.WRITE, `users/${uid}`);
   }
 
+  cacheUsernameEmailMapping(resolvedUsername, safeEmail);
+
   return {
     uid,
     displayName: safeDisplayName,
-    username: cleanUsername,
+    username: resolvedUsername,
     email: safeEmail,
     phoneTag: safePhone,
     bio: safeBio,
@@ -1271,13 +1348,19 @@ export async function ensureAuthorizedChatRoomInFirestore(params: {
   myUsername?: string;
   otherUsername?: string;
 }): Promise<string> {
+  const safeMyUsername =
+    sanitizeUsername(params.myUsername || '') ||
+    `user_${sanitizeDocId(params.myUid).slice(0, 8).toLowerCase()}`;
+  const safeOtherUsername =
+    sanitizeUsername(params.otherUsername || '') ||
+    `user_${sanitizeDocId(params.otherUid).slice(0, 8).toLowerCase()}`;
   return createOrGetAuthorizedChatRoom({
     myUid: params.myUid,
-    myName: params.myName || auth.currentUser?.displayName || 'مستخدم',
-    myUsername: params.myUsername || 'user_chat',
+    myName: params.myName || auth.currentUser?.displayName || safeMyUsername,
+    myUsername: safeMyUsername,
     otherUid: params.otherUid,
-    otherName: params.otherName || params.otherUsername || 'مستخدم',
-    otherUsername: params.otherUsername || 'user_chat',
+    otherName: params.otherName || safeOtherUsername,
+    otherUsername: safeOtherUsername,
   });
 }
 
@@ -1287,11 +1370,20 @@ export async function sendDirectMessageToAuthorizedChat(params: {
   recipientUid: string;
   senderName: string;
   senderUsername?: string;
+  recipientName?: string;
+  recipientUsername?: string;
   text: string;
   type?: 'text' | 'voice' | 'image' | 'file' | 'poll' | 'sticker';
   displayTime?: string;
 }): Promise<void> {
-  const chatId = buildDeterministicChatId(params.senderUid, params.recipientUid);
+  const chatId = await ensureAuthorizedChatRoomInFirestore({
+    myUid: params.senderUid,
+    otherUid: params.recipientUid,
+    myName: params.senderName,
+    myUsername: params.senderUsername,
+    otherName: params.recipientName,
+    otherUsername: params.recipientUsername,
+  });
   const msgId = params.id || `msg_${Date.now()}`;
   const timeStr =
     params.displayTime ||
@@ -1299,13 +1391,16 @@ export async function sendDirectMessageToAuthorizedChat(params: {
       hour: '2-digit',
       minute: '2-digit',
     });
+  const safeSenderUsername =
+    sanitizeUsername(params.senderUsername || '') ||
+    `user_${sanitizeDocId(params.senderUid).slice(0, 8).toLowerCase()}`;
   await sendAuthorizedMessageToChatRoom({
     chatId,
     messageId: msgId,
     senderUid: params.senderUid,
     recipientUid: params.recipientUid,
     senderName: params.senderName,
-    senderUsername: params.senderUsername || 'user_chat',
+    senderUsername: safeSenderUsername,
     text: params.text,
     messageType: params.type || 'text',
     displayTime: timeStr,
@@ -1321,6 +1416,7 @@ export function subscribeToAuthorizedChatMessages(
       recipientUid: string;
       senderName: string;
       text: string;
+      displayTime: string;
       type: 'text' | 'voice' | 'image' | 'sticker';
       createdAt: number;
     }>
@@ -1336,6 +1432,7 @@ export function subscribeToAuthorizedChatMessages(
         recipientUid: m.recipientUid,
         senderName: m.senderName,
         text: m.text,
+        displayTime: m.displayTime,
         type:
           m.messageType === 'voice' ||
           m.messageType === 'image' ||
