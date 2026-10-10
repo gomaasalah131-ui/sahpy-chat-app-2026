@@ -40,6 +40,11 @@ import {
   compressAvatarFile,
 } from './PhoneRegistrationScreen';
 import { WALLPAPER_THEMES } from '../data/initialChats';
+import {
+  auth,
+  findRegisteredUserInFirestore,
+  PublicDirectoryUser,
+} from '../lib/firebase';
 
 export function formatRemaining24h(expiresAt?: number): string {
   if (!expiresAt) return 'تختفي خلال 24 ساعة';
@@ -815,7 +820,7 @@ export const AddStoryModal: React.FC<AddStoryModalProps> = ({
 };
 
 // ==========================================
-// 4. New Chat Modal (Search by Phone OR Username)
+// 4. New Chat Modal (Search Registered Users in Firestore by @username or UID)
 // ==========================================
 interface NewChatModalProps {
   registeredUsers: RegisteredDirectoryUser[];
@@ -825,7 +830,8 @@ interface NewChatModalProps {
     phone: string,
     roleOrBio: string,
     avatar?: string,
-    username?: string
+    username?: string,
+    targetUid?: string
   ) => void;
   onOpenCreateGroup?: () => void;
 }
@@ -837,46 +843,90 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
   onOpenCreateGroup,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
-  const [name, setName] = useState('');
-  const [phone, setPhone] = useState('');
-  const [username, setUsername] = useState('');
-  const [bio, setBio] = useState('');
+  const [firestoreResult, setFirestoreResult] =
+    useState<PublicDirectoryUser | null>(null);
+  const [isSearchingFirestore, setIsSearchingFirestore] = useState(false);
+  const [searchError, setSearchError] = useState('');
 
-  const hasActiveSearch = searchQuery.trim().length >= 2;
+  const myUid = auth.currentUser?.uid || '';
+  const hasActiveSearch = searchQuery.trim().length >= 3;
 
-  const filteredDirectory = hasActiveSearch
-    ? registeredUsers.filter((u) => {
-        const q = searchQuery.trim().toLowerCase();
-        const qDigits = searchQuery.replace(/[^\d٠-٩۰-۹]/g, '');
-        const uDigits = (u.phone || '').replace(/[^\d]/g, '');
-        const uUsername = (u.username || '').toLowerCase();
-        const cleanQUser = q.replace(/^@+/, '');
-        return (
-          u.name.toLowerCase().includes(q) ||
-          u.phone.toLowerCase().includes(q) ||
-          (cleanQUser.length >= 2 && uUsername.includes(cleanQUser)) ||
-          (qDigits.length >= 3 && uDigits.includes(qDigits))
-        );
-      })
-    : [];
+  useEffect(() => {
+    const q = searchQuery.trim();
+    setSearchError('');
+    if (q.length < 3) {
+      setFirestoreResult(null);
+      return;
+    }
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!name.trim() && !phone.trim() && !username.trim()) return;
-    const finalName = name.trim() || username.trim() || phone.trim();
-    const finalPhone = phone.trim() || '+20 100 000 0000';
-    const finalUsername =
-      username.trim().replace(/^@+/, '') ||
-      finalName.toLowerCase().replace(/\s+/g, '_');
-    onCreateContact(
-      finalName,
-      finalPhone,
-      bio.trim() || 'متصل عبر SAHPY-CHAT ✨',
-      undefined,
-      finalUsername
-    );
-    onClose();
-  };
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      setIsSearchingFirestore(true);
+      try {
+        const found = await findRegisteredUserInFirestore(q);
+        if (!cancelled) {
+          if (found && found.uid !== myUid) {
+            setFirestoreResult(found);
+          } else {
+            setFirestoreResult(null);
+          }
+        }
+      } catch {
+        if (!cancelled) setFirestoreResult(null);
+      } finally {
+        if (!cancelled) setIsSearchingFirestore(false);
+      }
+    }, 300);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [searchQuery, myUid]);
+
+  const combinedDirectory = React.useMemo(() => {
+    if (!hasActiveSearch) return [];
+    const q = searchQuery.trim().toLowerCase();
+    const cleanQUser = q.replace(/^@+/, '');
+    const qDigits = searchQuery.replace(/[^\d٠-٩۰-۹]/g, '');
+
+    const map = new Map<string, RegisteredDirectoryUser>();
+
+    if (firestoreResult && firestoreResult.uid !== myUid) {
+      map.set(firestoreResult.uid, {
+        id: firestoreResult.uid,
+        uid: firestoreResult.uid,
+        name: firestoreResult.displayName,
+        phone: firestoreResult.phoneVerified ? 'مؤكد عبر OTP' : 'مسجل في Firestore',
+        username: firestoreResult.username,
+        bio: firestoreResult.bio || 'مستخدم موثق في SAHPY-CHAT ✨',
+        avatar:
+          'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=240&auto=format&fit=crop&q=80',
+        emailVerified: firestoreResult.emailVerified,
+        phoneVerified: firestoreResult.phoneVerified,
+        isOnline: true,
+        lastSeen: 'مسجل وموثق',
+      });
+    }
+
+    registeredUsers.forEach((u) => {
+      const uid = u.uid || u.id;
+      if (!uid || uid === myUid) return;
+      const uDigits = (u.phone || '').replace(/[^\d]/g, '');
+      const uUsername = (u.username || '').toLowerCase();
+      const matches =
+        uid.toLowerCase() === q ||
+        (cleanQUser.length >= 3 && uUsername === cleanQUser) ||
+        (cleanQUser.length >= 3 && uUsername.includes(cleanQUser)) ||
+        (qDigits.length >= 5 && uDigits.includes(qDigits));
+
+      if (matches && !map.has(uid)) {
+        map.set(uid, { ...u, id: uid, uid });
+      }
+    });
+
+    return Array.from(map.values());
+  }, [hasActiveSearch, searchQuery, firestoreResult, registeredUsers, myUid]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-fade-in">
@@ -888,10 +938,10 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
             </div>
             <div>
               <h3 className="text-base font-bold text-white">
-                بدء محادثة جديدة (بالرقم أو اليوزر @)
+                بدء محادثة موثقة (بحث عبر Firestore)
               </h3>
               <p className="text-[11px] text-slate-400">
-                ابحث برقم الهاتف أو اسم المستخدم (@username) أو أنشئ مجموعة
+                ابحث عن المستخدمين المسجلين فعلياً باستخدام @username أو UID الحقيقي
               </p>
             </div>
           </div>
@@ -918,11 +968,10 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
           </div>
         </div>
 
-        <div className="p-5 space-y-5 overflow-y-auto custom-scrollbar">
-          {/* Search Registered Users by Phone OR Username */}
+        <div className="p-5 space-y-4 overflow-y-auto custom-scrollbar">
           <div className="space-y-3">
             <label className="block text-xs font-bold text-emerald-400">
-              1. بحث سريع بالرقم (010...) أو باليوزر (@salah_gomaa):
+              ابحث عن مستخدم مسجل في Firestore بواسطة اسم المستخدم الفريد (@username) أو UID أو رقم الهاتف:
             </label>
             <div className="relative">
               <Search className="w-4 h-4 text-slate-400 absolute right-3.5 top-1/2 -translate-y-1/2" />
@@ -930,28 +979,41 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="اكتب رقم الهاتف أو @username للبحث الفوري..."
+                placeholder="اكتب @username أو UID الحقيقي للمستخدم..."
                 className="w-full py-2.5 pr-10 pl-4 rounded-xl bg-slate-800/90 border border-white/10 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50"
               />
             </div>
 
-            <div className="max-h-48 overflow-y-auto space-y-2 pr-1 custom-scrollbar">
+            {searchError && (
+              <p className="text-xs text-rose-400 font-medium">{searchError}</p>
+            )}
+
+            <div className="max-h-64 overflow-y-auto space-y-2 pr-1 custom-scrollbar">
               {!hasActiveSearch ? (
-                <div className="p-3.5 rounded-2xl bg-slate-800/40 border border-white/10 flex items-center gap-2.5 text-xs text-slate-400">
-                  <Lock className="w-4 h-4 text-emerald-400 shrink-0" />
+                <div className="p-3.5 rounded-2xl bg-slate-800/40 border border-white/10 flex items-start gap-2.5 text-xs text-slate-300 leading-relaxed">
+                  <Lock className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
                   <span>
-                    الخصوصية مفعّلة (مثل واتساب): لا تظهر الحسابات المسجلة تلقائياً. اكتب رقم الهاتف أو اليوزر (<span dir="ltr" className="text-emerald-400 font-mono">@username</span>) بالأعلى للبحث والمراسلة.
+                    حماية كاملة: لا يُسمح بإنشاء محادثة مع اسم عشوائي أو مستخدم غير موجود. اكتب اسم المستخدم الفريد (<span dir="ltr" className="text-emerald-400 font-mono">@username</span>) أو المعرّف (<span dir="ltr" className="text-cyan-400 font-mono">UID</span>) للبحث في قاعدة بيانات Firestore.
                   </span>
                 </div>
-              ) : filteredDirectory.length === 0 ? (
-                <p className="text-xs text-slate-400 text-center py-3">
-                  لا يوجد رقم أو يوزر مطابق، يمكنك إضافته يدوياً بالأسفل.
+              ) : isSearchingFirestore ? (
+                <p className="text-xs text-emerald-300 text-center py-4 animate-pulse">
+                  جاري البحث في قاعدة بيانات Firebase Firestore...
                 </p>
+              ) : combinedDirectory.length === 0 ? (
+                <div className="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-200 text-center space-y-1">
+                  <p className="font-bold">
+                    لا يوجد مستخدم مسجل بهذا المعرّف في Firestore
+                  </p>
+                  <p className="text-[11px] text-rose-300/80">
+                    تأكد من أن صديقك قام بإنشاء حسابه وتأكيد بريده الإلكتروني في SAHPY-CHAT، ثم ابحث عنه باستخدام @username أو UID الصحيح.
+                  </p>
+                </div>
               ) : (
-                filteredDirectory.map((user) => (
+                combinedDirectory.map((user) => (
                   <div
-                    key={user.id}
-                    className="flex items-center justify-between gap-3 p-2.5 rounded-2xl bg-slate-800/60 border border-white/10 hover:border-emerald-500/40 transition-all"
+                    key={user.uid || user.id}
+                    className="flex items-center justify-between gap-3 p-3 rounded-2xl bg-slate-800/60 border border-white/10 hover:border-emerald-500/40 transition-all"
                   >
                     <div className="flex items-center gap-2.5 min-w-0">
                       <img
@@ -960,9 +1022,12 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
                         className="w-10 h-10 rounded-xl object-cover shrink-0"
                       />
                       <div className="min-w-0">
-                        <h4 className="text-xs font-bold text-white truncate">
-                          {user.name}
-                        </h4>
+                        <div className="flex items-center gap-1.5">
+                          <h4 className="text-xs font-bold text-white truncate">
+                            {user.name}
+                          </h4>
+                          <ShieldCheck className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                        </div>
                         <div className="flex items-center gap-1.5 text-[11px] font-mono">
                           {user.username && (
                             <span dir="ltr" className="text-cyan-400">
@@ -970,8 +1035,11 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
                             </span>
                           )}
                           <span className="text-slate-600">•</span>
-                          <span dir="ltr" className="text-emerald-400">
-                            {user.phone}
+                          <span
+                            dir="ltr"
+                            className="text-slate-400 text-[10px] truncate"
+                          >
+                            UID: {(user.uid || user.id).slice(0, 8)}...
                           </span>
                         </div>
                       </div>
@@ -984,99 +1052,21 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
                           user.phone,
                           user.bio,
                           user.avatar,
-                          user.username
+                          user.username,
+                          user.uid || user.id
                         );
                         onClose();
                       }}
-                      className="px-3 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 shrink-0 cursor-pointer"
+                      className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs flex items-center gap-1.5 shrink-0 cursor-pointer"
                     >
                       <MessageSquare className="w-3.5 h-3.5" />
-                      <span>مراسلة</span>
+                      <span>بدء محادثة</span>
                     </button>
                   </div>
                 ))
               )}
             </div>
           </div>
-
-          {/* Manual Phone + Username Addition */}
-          <form
-            onSubmit={handleSubmit}
-            className="space-y-3 pt-4 border-t border-white/10"
-          >
-            <label className="block text-xs font-bold text-slate-300">
-              2. أو إضافة جهة اتصال جديدة بالرقم واليوزر نيم:
-            </label>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-[11px] text-slate-400 mb-1">
-                  الاسم الكامل
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={name}
-                  onChange={(e) => setName(e.target.value)}
-                  placeholder="مثال: د. طارق نبيل"
-                  className="w-full py-2 px-3 rounded-xl bg-slate-800/90 border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50"
-                />
-              </div>
-
-              <div>
-                <label className="block text-[11px] text-slate-400 mb-1">
-                  رقم الهاتف
-                </label>
-                <input
-                  type="text"
-                  required
-                  dir="ltr"
-                  value={phone}
-                  onChange={(e) => setPhone(e.target.value)}
-                  placeholder="+20 100 555 7788"
-                  className="w-full py-2 px-3 rounded-xl bg-slate-800/90 border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50 text-left font-mono"
-                />
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div>
-                <label className="block text-[11px] text-slate-400 mb-1">
-                  اليوزر نيم (Username @)
-                </label>
-                <div className="relative">
-                  <AtSign className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
-                  <input
-                    type="text"
-                    dir="ltr"
-                    value={username}
-                    onChange={(e) => setUsername(e.target.value)}
-                    placeholder="tarek_nabil"
-                    className="w-full py-2 pl-8 pr-3 rounded-xl bg-slate-800/90 border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50 text-left font-mono"
-                  />
-                </div>
-              </div>
-
-              <div>
-                <label className="block text-[11px] text-slate-400 mb-1">
-                  نبذة أو المسمى الوظيفي
-                </label>
-                <input
-                  type="text"
-                  value={bio}
-                  onChange={(e) => setBio(e.target.value)}
-                  placeholder="استشاري تطوير أعمال 🌟"
-                  className="w-full py-2 px-3 rounded-xl bg-slate-800/90 border border-white/10 text-xs text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50"
-                />
-              </div>
-            </div>
-
-            <button
-              type="submit"
-              className="w-full py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs transition-all cursor-pointer shadow-lg shadow-emerald-500/20"
-            >
-              إضافة وبدء المحادثة الآن
-            </button>
-          </form>
         </div>
       </div>
     </div>
@@ -1481,8 +1471,6 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
   const [phone, setPhone] = useState(userPhone);
   const [bio, setBio] = useState(userBio);
   const [avatar, setAvatar] = useState(userAvatar);
-  const [step, setStep] = useState<'profile' | 'otp'>('profile');
-  const [otp, setOtp] = useState(['4', '2', '9', '1']);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const handleAvatarFileChange = async (
@@ -1519,7 +1507,7 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
             </div>
             <div>
               <h3 className="text-base font-bold text-white">
-                {step === 'profile' ? 'الملف الشخصي في SAHPY-CHAT' : 'تأكيد رقم الهاتف (OTP)'}
+                الملف الشخصي الموثق في SAHPY-CHAT
               </h3>
               <p className="text-[11px] text-slate-400">
                 𝔼𝕟𝕘𝕚𝕟𝕖𝕖𝕣 𝕊𝔸𝕃𝔸ℍ 𝔾𝕆𝕄𝔸𝔸
@@ -1534,142 +1522,101 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
           </button>
         </div>
 
-        {step === 'profile' ? (
-          <form onSubmit={handleSave} className="p-5 space-y-4">
-            <div className="flex items-center gap-4 p-3 rounded-2xl bg-slate-800/50 border border-white/5">
-              <div
-                onClick={() => fileInputRef.current?.click()}
-                className="relative w-16 h-16 rounded-2xl overflow-hidden border-2 border-emerald-500/40 cursor-pointer group shrink-0"
-                title="اضغط لتغيير صورة البروفايل"
-              >
-                <img
-                  src={avatar}
-                  alt={name}
-                  className="w-full h-full object-cover group-hover:scale-105 transition-transform"
-                />
-                <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
-                  <Camera className="w-5 h-5 text-white" />
-                </div>
-              </div>
-              <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-1.5 text-emerald-400 text-xs font-medium mb-0.5">
-                  <ShieldCheck className="w-4 h-4" />
-                  <span>حساب موثق على SAHPY-CHAT</span>
-                </div>
-                <p className="text-sm font-bold text-white truncate">{name}</p>
-                <p className="text-xs text-slate-400 font-mono" dir="ltr">
-                  {phone}
-                </p>
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="mt-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/30 text-emerald-300 text-[11px] font-bold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
-                >
-                  <Upload className="w-3 h-3" />
-                  <span>تغيير صورة البروفايل</span>
-                </button>
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept="image/*"
-                  onChange={handleAvatarFileChange}
-                  className="hidden"
-                />
-              </div>
-              <div className="p-2.5 rounded-xl bg-white/5 border border-white/10 text-slate-300">
-                <QrCode className="w-6 h-6" />
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-xs text-slate-400 mb-1.5">الاسم المعروض</label>
-              <input
-                type="text"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                className="w-full py-2.5 px-3.5 rounded-xl bg-slate-800/90 border border-white/10 text-sm text-white focus:outline-none focus:border-emerald-500/50"
-              />
-            </div>
-
-            <div>
-              <div className="flex items-center justify-between mb-1.5">
-                <label className="text-xs text-slate-400">رقم الهاتف المرتبط</label>
-                <button
-                  type="button"
-                  onClick={() => setStep('otp')}
-                  className="text-[11px] text-emerald-400 hover:underline cursor-pointer"
-                >
-                  تغيير وتأكيد الرمز
-                </button>
-              </div>
-              <input
-                type="text"
-                dir="ltr"
-                value={phone}
-                onChange={(e) => setPhone(e.target.value)}
-                className="w-full py-2.5 px-3.5 rounded-xl bg-slate-800/90 border border-white/10 text-sm text-white focus:outline-none focus:border-emerald-500/50 text-left font-mono"
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs text-slate-400 mb-1.5">الحالة (Bio)</label>
-              <input
-                type="text"
-                value={bio}
-                onChange={(e) => setBio(e.target.value)}
-                className="w-full py-2.5 px-3.5 rounded-xl bg-slate-800/90 border border-white/10 text-sm text-white focus:outline-none focus:border-emerald-500/50"
-              />
-            </div>
-
-            <button
-              type="submit"
-              className="w-full py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm transition-all cursor-pointer shadow-lg shadow-emerald-500/20"
+        <form onSubmit={handleSave} className="p-5 space-y-4">
+          <div className="flex items-center gap-4 p-3 rounded-2xl bg-slate-800/50 border border-white/5">
+            <div
+              onClick={() => fileInputRef.current?.click()}
+              className="relative w-16 h-16 rounded-2xl overflow-hidden border-2 border-emerald-500/40 cursor-pointer group shrink-0"
+              title="اضغط لتغيير صورة البروفايل"
             >
-              حفظ وتحديث الحساب
-            </button>
-          </form>
-        ) : (
-          <div className="p-5 space-y-5 text-center">
-            <p className="text-xs text-slate-300 leading-relaxed">
-              تم إرسال رمز تحقق مكون من 4 أرقام إلى الرقم{' '}
-              <span className="text-emerald-400 font-mono font-bold" dir="ltr">
-                {phone}
-              </span>
-            </p>
-            <div className="flex items-center justify-center gap-3" dir="ltr">
-              {otp.map((digit, i) => (
-                <input
-                  key={i}
-                  type="text"
-                  maxLength={1}
-                  value={digit}
-                  onChange={(e) => {
-                    const next = [...otp];
-                    next[i] = e.target.value;
-                    setOtp(next);
-                  }}
-                  className="w-12 h-14 rounded-2xl bg-slate-800 border border-emerald-500/40 text-center text-lg font-bold text-white font-mono focus:outline-none focus:border-emerald-400"
-                />
-              ))}
+              <img
+                src={avatar}
+                alt={name}
+                className="w-full h-full object-cover group-hover:scale-105 transition-transform"
+              />
+              <div className="absolute inset-0 bg-black/50 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center">
+                <Camera className="w-5 h-5 text-white" />
+              </div>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-1.5 text-emerald-400 text-xs font-medium mb-0.5">
+                <ShieldCheck className="w-4 h-4" />
+                <span>حساب موثق على Firebase</span>
+              </div>
+              <p className="text-sm font-bold text-white truncate">{name}</p>
+              {auth.currentUser?.uid && (
+                <p
+                  className="text-[10px] text-cyan-400 font-mono truncate"
+                  dir="ltr"
+                >
+                  UID: {auth.currentUser.uid}
+                </p>
+              )}
               <button
                 type="button"
-                onClick={() => setStep('profile')}
-                className="flex-1 py-2.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm transition-all cursor-pointer"
+                onClick={() => fileInputRef.current?.click()}
+                className="mt-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/30 text-emerald-300 text-[11px] font-bold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
               >
-                تأكيد الرمز
+                <Upload className="w-3 h-3" />
+                <span>تغيير صورة البروفايل</span>
               </button>
-              <button
-                type="button"
-                onClick={() => setStep('profile')}
-                className="p-2.5 rounded-xl bg-white/5 hover:bg-white/10 text-slate-300 cursor-pointer"
-              >
-                <ArrowLeft className="w-5 h-5" />
-              </button>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept="image/*"
+                onChange={handleAvatarFileChange}
+                className="hidden"
+              />
+            </div>
+            <div className="p-2.5 rounded-xl bg-white/5 border border-white/10 text-slate-300">
+              <QrCode className="w-6 h-6" />
             </div>
           </div>
-        )}
+
+          <div>
+            <label className="block text-xs text-slate-400 mb-1.5">
+              الاسم المعروض
+            </label>
+            <input
+              type="text"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              className="w-full py-2.5 px-3.5 rounded-xl bg-slate-800/90 border border-white/10 text-sm text-white focus:outline-none focus:border-emerald-500/50"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs text-slate-400 mb-1.5">
+              رقم الهاتف المرتبط
+            </label>
+            <input
+              type="text"
+              dir="ltr"
+              value={phone}
+              onChange={(e) => setPhone(e.target.value)}
+              className="w-full py-2.5 px-3.5 rounded-xl bg-slate-800/90 border border-white/10 text-sm text-white focus:outline-none focus:border-emerald-500/50 text-left font-mono"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs text-slate-400 mb-1.5">
+              الحالة (Bio)
+            </label>
+            <input
+              type="text"
+              value={bio}
+              onChange={(e) => setBio(e.target.value)}
+              className="w-full py-2.5 px-3.5 rounded-xl bg-slate-800/90 border border-white/10 text-sm text-white focus:outline-none focus:border-emerald-500/50"
+            />
+          </div>
+
+          <button
+            type="submit"
+            className="w-full py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm transition-all cursor-pointer shadow-lg shadow-emerald-500/20"
+          >
+            حفظ وتحديث الحساب في Firestore
+          </button>
+        </form>
       </div>
     </div>
   );

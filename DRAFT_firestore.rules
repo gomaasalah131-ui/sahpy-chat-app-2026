@@ -21,6 +21,10 @@ service cloud.firestore {
       return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
     }
 
+    function isValidUsernameId(username) {
+      return username is string && username.size() >= 3 && username.size() <= 30 && username.matches('^[a-z0-9_]+$');
+    }
+
     function incoming() {
       return request.resource.data;
     }
@@ -29,23 +33,31 @@ service cloud.firestore {
       return resource.data;
     }
 
-    // Entity 1: UserProfile Validation Blueprint
+    // Entity 1: UserProfile Validation Blueprint (Private Owner-Only PII)
     function isValidUserProfile(data) {
       return data.keys().hasAll([
           'uid',
           'displayName',
+          'username',
+          'email',
           'phoneTag',
           'bio',
           'wallpaperTheme',
+          'emailVerified',
+          'phoneVerified',
           'createdAt',
           'updatedAt'
         ])
         && data.keys().hasOnly([
           'uid',
           'displayName',
+          'username',
+          'email',
           'phoneTag',
           'bio',
           'wallpaperTheme',
+          'emailVerified',
+          'phoneVerified',
           'createdAt',
           'updatedAt'
         ])
@@ -57,6 +69,13 @@ service cloud.firestore {
         && data.displayName is string
         && data.displayName.size() >= 1
         && data.displayName.size() <= 80
+        && data.username is string
+        && data.username.size() >= 3
+        && data.username.size() <= 30
+        && data.username.matches('^[a-z0-9_]+$')
+        && data.email is string
+        && data.email.size() >= 5
+        && data.email.size() <= 120
         && data.phoneTag is string
         && data.phoneTag.size() >= 7
         && data.phoneTag.size() <= 20
@@ -73,11 +92,249 @@ service cloud.firestore {
           data.wallpaperTheme == 'emerald-matrix' ||
           data.wallpaperTheme == 'royal-amethyst'
         )
+        && data.emailVerified is bool
+        && data.phoneVerified is bool
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
 
-    // Entity 2: SavedContact Validation Blueprint
+    // Entity 2: PublicDirectoryProfile Validation Blueprint (Non-PII Public Profile)
+    function isValidPublicDirectoryProfile(data) {
+      return data.keys().hasAll([
+          'uid',
+          'username',
+          'displayName',
+          'bio',
+          'avatarFallbackColor',
+          'emailVerified',
+          'phoneVerified',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid',
+          'username',
+          'displayName',
+          'bio',
+          'avatarFallbackColor',
+          'emailVerified',
+          'phoneVerified',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.uid is string
+        && data.uid.size() >= 1
+        && data.uid.size() <= 128
+        && data.uid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.uid == request.auth.uid
+        && data.username is string
+        && data.username.size() >= 3
+        && data.username.size() <= 30
+        && data.username.matches('^[a-z0-9_]+$')
+        && data.displayName is string
+        && data.displayName.size() >= 1
+        && data.displayName.size() <= 80
+        && data.bio is string
+        && data.bio.size() <= 200
+        && data.avatarFallbackColor is string
+        && data.avatarFallbackColor.size() >= 1
+        && data.avatarFallbackColor.size() <= 40
+        && data.emailVerified is bool
+        && data.phoneVerified is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Entity 3: UsernameReservation Validation Blueprint
+    function isValidUsernameReservation(data) {
+      return data.keys().hasAll([
+          'uid',
+          'username',
+          'displayName',
+          'bio',
+          'avatarFallbackColor',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid',
+          'username',
+          'displayName',
+          'bio',
+          'avatarFallbackColor',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.uid is string
+        && data.uid.size() >= 1
+        && data.uid.size() <= 128
+        && data.uid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.uid == request.auth.uid
+        && data.username is string
+        && data.username.size() >= 3
+        && data.username.size() <= 30
+        && data.username.matches('^[a-z0-9_]+$')
+        && data.displayName is string
+        && data.displayName.size() >= 1
+        && data.displayName.size() <= 80
+        && data.bio is string
+        && data.bio.size() <= 200
+        && data.avatarFallbackColor is string
+        && data.avatarFallbackColor.size() >= 1
+        && data.avatarFallbackColor.size() <= 40
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Entity 4: ChatRoom Validation Blueprint
+    function isValidChatRoom(data) {
+      return data.keys().hasAll([
+          'chatId',
+          'participantOneUid',
+          'participantTwoUid',
+          'participantOneName',
+          'participantTwoName',
+          'participantOneUsername',
+          'participantTwoUsername',
+          'createdByUid',
+          'lastMessageText',
+          'lastMessageSenderUid',
+          'lastMessageTime',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'chatId',
+          'participantOneUid',
+          'participantTwoUid',
+          'participantOneName',
+          'participantTwoName',
+          'participantOneUsername',
+          'participantTwoUsername',
+          'createdByUid',
+          'lastMessageText',
+          'lastMessageSenderUid',
+          'lastMessageTime',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.chatId is string
+        && data.chatId.size() >= 1
+        && data.chatId.size() <= 128
+        && data.chatId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.participantOneUid is string
+        && data.participantOneUid.size() >= 1
+        && data.participantOneUid.size() <= 128
+        && data.participantOneUid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.participantTwoUid is string
+        && data.participantTwoUid.size() >= 1
+        && data.participantTwoUid.size() <= 128
+        && data.participantTwoUid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.participantOneName is string
+        && data.participantOneName.size() >= 1
+        && data.participantOneName.size() <= 80
+        && data.participantTwoName is string
+        && data.participantTwoName.size() >= 1
+        && data.participantTwoName.size() <= 80
+        && data.participantOneUsername is string
+        && data.participantOneUsername.size() >= 3
+        && data.participantOneUsername.size() <= 30
+        && data.participantOneUsername.matches('^[a-z0-9_]+$')
+        && data.participantTwoUsername is string
+        && data.participantTwoUsername.size() >= 3
+        && data.participantTwoUsername.size() <= 30
+        && data.participantTwoUsername.matches('^[a-z0-9_]+$')
+        && data.createdByUid is string
+        && data.createdByUid.size() >= 1
+        && data.createdByUid.size() <= 128
+        && data.createdByUid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.lastMessageText is string
+        && data.lastMessageText.size() >= 1
+        && data.lastMessageText.size() <= 500
+        && data.lastMessageSenderUid is string
+        && data.lastMessageSenderUid.size() >= 1
+        && data.lastMessageSenderUid.size() <= 128
+        && data.lastMessageSenderUid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.lastMessageTime is string
+        && data.lastMessageTime.size() >= 1
+        && data.lastMessageTime.size() <= 40
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Entity 5: DirectMessage Validation Blueprint
+    function isValidDirectMessage(data) {
+      return data.keys().hasAll([
+          'chatId',
+          'senderUid',
+          'recipientUid',
+          'senderName',
+          'senderUsername',
+          'text',
+          'messageType',
+          'displayTime',
+          'isStarred',
+          'isPinned',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'chatId',
+          'senderUid',
+          'recipientUid',
+          'senderName',
+          'senderUsername',
+          'text',
+          'messageType',
+          'displayTime',
+          'isStarred',
+          'isPinned',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.chatId is string
+        && data.chatId.size() >= 1
+        && data.chatId.size() <= 128
+        && data.chatId.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.senderUid is string
+        && data.senderUid.size() >= 1
+        && data.senderUid.size() <= 128
+        && data.senderUid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.senderUid == request.auth.uid
+        && data.recipientUid is string
+        && data.recipientUid.size() >= 1
+        && data.recipientUid.size() <= 128
+        && data.recipientUid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.senderName is string
+        && data.senderName.size() >= 1
+        && data.senderName.size() <= 80
+        && data.senderUsername is string
+        && data.senderUsername.size() >= 3
+        && data.senderUsername.size() <= 30
+        && data.senderUsername.matches('^[a-z0-9_]+$')
+        && data.text is string
+        && data.text.size() >= 1
+        && data.text.size() <= 2000
+        && data.messageType is string
+        && data.messageType.size() <= 20
+        && (
+          data.messageType == 'text' ||
+          data.messageType == 'voice' ||
+          data.messageType == 'image' ||
+          data.messageType == 'file' ||
+          data.messageType == 'poll' ||
+          data.messageType == 'sticker'
+        )
+        && data.displayTime is string
+        && data.displayTime.size() >= 1
+        && data.displayTime.size() <= 40
+        && data.isStarred is bool
+        && data.isPinned is bool
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Entity 6: SavedContact Validation Blueprint
     function isValidSavedContact(data) {
       return data.keys().hasAll([
           'ownerUid',
@@ -127,7 +384,7 @@ service cloud.firestore {
         && data.updatedAt is timestamp;
     }
 
-    // Entity 3: ChatMessage Validation Blueprint
+    // Entity 7: ChatMessage Validation Blueprint
     function isValidChatMessage(data) {
       return data.keys().hasAll([
           'ownerUid',
@@ -180,7 +437,8 @@ service cloud.firestore {
           data.messageType == 'voice' ||
           data.messageType == 'image' ||
           data.messageType == 'file' ||
-          data.messageType == 'poll'
+          data.messageType == 'poll' ||
+          data.messageType == 'sticker'
         )
         && data.displayTime is string
         && data.displayTime.size() >= 1
@@ -203,7 +461,16 @@ service cloud.firestore {
         && get(/databases/$(database)/documents/users/$(userId)/contacts/$(contactId)).data.ownerUid == request.auth.uid;
     }
 
-    // Collection 1: /users/{userId}
+    // Master Gate Helper 3: Verify Caller is an Authorized Participant of Parent ChatRoom
+    function isAuthorizedChatParticipant(chatId) {
+      return exists(/databases/$(database)/documents/chats/$(chatId))
+        && (
+          get(/databases/$(database)/documents/chats/$(chatId)).data.participantOneUid == request.auth.uid ||
+          get(/databases/$(database)/documents/chats/$(chatId)).data.participantTwoUid == request.auth.uid
+        );
+    }
+
+    // Collection 1: /users/{userId} (Private Owner-Only Profile & PII)
     match /users/{userId} {
       allow get: if isSignedIn()
         && isValidId(userId)
@@ -219,22 +486,27 @@ service cloud.firestore {
         && request.auth.uid == userId
         && isValidUserProfile(incoming())
         && incoming().createdAt == request.time
-        && incoming().updatedAt == request.time;
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/usernames/$(incoming().username))
+        && getAfter(/databases/$(database)/documents/usernames/$(incoming().username)).data.uid == request.auth.uid;
 
       allow update: if isVerifiedUser()
         && isValidId(userId)
         && request.auth.uid == userId
         && isValidUserProfile(incoming())
         && incoming().uid == existing().uid
+        && incoming().username == existing().username
+        && incoming().email == existing().email
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
-          // Action 1: Update profile fields or wallpaper theme
           incoming().diff(existing()).affectedKeys().hasOnly([
             'displayName',
             'phoneTag',
             'bio',
             'wallpaperTheme',
+            'emailVerified',
+            'phoneVerified',
             'updatedAt'
           ])
         );
@@ -244,7 +516,7 @@ service cloud.firestore {
         && request.auth.uid == userId
         && existing().uid == request.auth.uid;
 
-      // Subcollection 2: /users/{userId}/contacts/{contactId}
+      // Subcollection: /users/{userId}/contacts/{contactId}
       match /contacts/{contactId} {
         allow get: if isSignedIn()
           && isValidId(userId)
@@ -276,7 +548,6 @@ service cloud.firestore {
           && incoming().updatedAt == request.time
           && isParentUserOwner(userId)
           && (
-            // Action 1: Update mute/block/pin or contact profile details
             incoming().diff(existing()).affectedKeys().hasOnly([
               'contactName',
               'contactBio',
@@ -294,7 +565,7 @@ service cloud.firestore {
           && existing().ownerUid == request.auth.uid
           && isParentUserOwner(userId);
 
-        // Subcollection 3: /users/{userId}/contacts/{contactId}/messages/{messageId}
+        // Subcollection: /users/{userId}/contacts/{contactId}/messages/{messageId}
         match /messages/{messageId} {
           allow get: if isSignedIn()
             && isValidId(userId)
@@ -333,7 +604,6 @@ service cloud.firestore {
             && incoming().updatedAt == request.time
             && isParentContactOwner(userId, contactId)
             && (
-              // Action 1: Toggle star or pin on message
               incoming().diff(existing()).affectedKeys().hasOnly([
                 'isStarred',
                 'isPinned',
@@ -349,6 +619,203 @@ service cloud.firestore {
             && existing().ownerUid == request.auth.uid
             && isParentContactOwner(userId, contactId);
         }
+      }
+    }
+
+    // Collection 2: /directory/{userId} (Public Non-PII Profile for UID Lookup)
+    match /directory/{userId} {
+      allow get: if isSignedIn() && isValidId(userId);
+
+      allow list: if isSignedIn() && existing().uid == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isValidId(userId)
+        && request.auth.uid == userId
+        && isValidPublicDirectoryProfile(incoming())
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && existsAfter(/databases/$(database)/documents/usernames/$(incoming().username))
+        && getAfter(/databases/$(database)/documents/usernames/$(incoming().username)).data.uid == request.auth.uid;
+
+      allow update: if isVerifiedUser()
+        && isValidId(userId)
+        && request.auth.uid == userId
+        && isValidPublicDirectoryProfile(incoming())
+        && incoming().uid == existing().uid
+        && incoming().username == existing().username
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'displayName',
+            'bio',
+            'avatarFallbackColor',
+            'emailVerified',
+            'phoneVerified',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidId(userId)
+        && request.auth.uid == userId
+        && existing().uid == request.auth.uid;
+    }
+
+    // Collection 3: /usernames/{username} (Atomic Unique Username Reservation & Lookup)
+    match /usernames/{username} {
+      allow get: if isSignedIn() && isValidUsernameId(username);
+
+      allow list: if isSignedIn() && existing().uid == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isValidUsernameId(username)
+        && isValidUsernameReservation(incoming())
+        && incoming().username == username
+        && incoming().uid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && !exists(/databases/$(database)/documents/usernames/$(username));
+
+      allow update: if isVerifiedUser()
+        && isValidUsernameId(username)
+        && isValidUsernameReservation(incoming())
+        && existing().uid == request.auth.uid
+        && incoming().uid == existing().uid
+        && incoming().username == existing().username
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'displayName',
+            'bio',
+            'avatarFallbackColor',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidUsernameId(username)
+        && existing().uid == request.auth.uid;
+    }
+
+    // Collection 4: /chats/{chatId} (Authorized 2-Participant ChatRoom)
+    match /chats/{chatId} {
+      allow get: if isSignedIn()
+        && isValidId(chatId)
+        && (
+          existing().participantOneUid == request.auth.uid ||
+          existing().participantTwoUid == request.auth.uid
+        );
+
+      allow list: if isSignedIn()
+        && (
+          existing().participantOneUid == request.auth.uid ||
+          existing().participantTwoUid == request.auth.uid
+        );
+
+      allow create: if isVerifiedUser()
+        && isValidId(chatId)
+        && isValidChatRoom(incoming())
+        && incoming().chatId == chatId
+        && incoming().createdByUid == request.auth.uid
+        && (
+          incoming().participantOneUid == request.auth.uid ||
+          incoming().participantTwoUid == request.auth.uid
+        )
+        && incoming().participantOneUid != incoming().participantTwoUid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && exists(/databases/$(database)/documents/directory/$(incoming().participantOneUid))
+        && exists(/databases/$(database)/documents/directory/$(incoming().participantTwoUid));
+
+      allow update: if isVerifiedUser()
+        && isValidId(chatId)
+        && isValidChatRoom(incoming())
+        && (
+          existing().participantOneUid == request.auth.uid ||
+          existing().participantTwoUid == request.auth.uid
+        )
+        && incoming().chatId == existing().chatId
+        && incoming().participantOneUid == existing().participantOneUid
+        && incoming().participantTwoUid == existing().participantTwoUid
+        && incoming().createdByUid == existing().createdByUid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().lastMessageSenderUid == request.auth.uid
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'lastMessageText',
+            'lastMessageSenderUid',
+            'lastMessageTime',
+            'participantOneName',
+            'participantTwoName',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if false;
+
+      // Subcollection 5: /chats/{chatId}/messages/{messageId} (Authorized DirectMessages)
+      match /messages/{messageId} {
+        allow get: if isSignedIn()
+          && isValidId(chatId)
+          && isValidId(messageId)
+          && (
+            existing().senderUid == request.auth.uid ||
+            existing().recipientUid == request.auth.uid
+          )
+          && isAuthorizedChatParticipant(chatId);
+
+        allow list: if isSignedIn()
+          && (
+            existing().senderUid == request.auth.uid ||
+            existing().recipientUid == request.auth.uid
+          );
+
+        allow create: if isVerifiedUser()
+          && isValidId(chatId)
+          && isValidId(messageId)
+          && isValidDirectMessage(incoming())
+          && incoming().chatId == chatId
+          && incoming().senderUid == request.auth.uid
+          && incoming().senderUid != incoming().recipientUid
+          && incoming().createdAt == request.time
+          && incoming().updatedAt == request.time
+          && isAuthorizedChatParticipant(chatId);
+
+        allow update: if isVerifiedUser()
+          && isValidId(chatId)
+          && isValidId(messageId)
+          && isValidDirectMessage(incoming())
+          && (
+            existing().senderUid == request.auth.uid ||
+            existing().recipientUid == request.auth.uid
+          )
+          && incoming().chatId == existing().chatId
+          && incoming().senderUid == existing().senderUid
+          && incoming().recipientUid == existing().recipientUid
+          && incoming().senderName == existing().senderName
+          && incoming().senderUsername == existing().senderUsername
+          && incoming().text == existing().text
+          && incoming().messageType == existing().messageType
+          && incoming().displayTime == existing().displayTime
+          && incoming().createdAt == existing().createdAt
+          && incoming().updatedAt == request.time
+          && isAuthorizedChatParticipant(chatId)
+          && (
+            incoming().diff(existing()).affectedKeys().hasOnly([
+              'isStarred',
+              'isPinned',
+              'updatedAt'
+            ])
+          );
+
+        allow delete: if isVerifiedUser()
+          && isValidId(chatId)
+          && isValidId(messageId)
+          && existing().senderUid == request.auth.uid
+          && isAuthorizedChatParticipant(chatId);
       }
     }
   }

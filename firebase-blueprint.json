@@ -2,7 +2,7 @@
   "entities": {
     "UserProfile": {
       "title": "UserProfile",
-      "description": "Authenticated user profile and global chat preferences.",
+      "description": "Authenticated owner-only user profile with PII (email and phoneTag) and verification state.",
       "type": "object",
       "properties": {
         "uid": {
@@ -14,13 +14,26 @@
         },
         "displayName": {
           "type": "string",
-          "description": "Display name of the user.",
+          "description": "Full display name of the user.",
           "minLength": 1,
           "maxLength": 80
         },
+        "username": {
+          "type": "string",
+          "description": "Unique lowercase username identifier.",
+          "minLength": 3,
+          "maxLength": 30,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "email": {
+          "type": "string",
+          "description": "Registered email address (private to owner).",
+          "minLength": 5,
+          "maxLength": 120
+        },
         "phoneTag": {
           "type": "string",
-          "description": "Normalized registered phone number identifier.",
+          "description": "E.164 phone number with country code (private to owner).",
           "minLength": 7,
           "maxLength": 20,
           "pattern": "^[0-9+]+$"
@@ -43,6 +56,14 @@
             "royal-amethyst"
           ]
         },
+        "emailVerified": {
+          "type": "boolean",
+          "description": "Whether the user's email has been verified via Firebase Auth."
+        },
+        "phoneVerified": {
+          "type": "boolean",
+          "description": "Whether the user's phone number has been verified via Firebase Phone Auth OTP."
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time",
@@ -57,9 +78,334 @@
       "required": [
         "uid",
         "displayName",
+        "username",
+        "email",
         "phoneTag",
         "bio",
         "wallpaperTheme",
+        "emailVerified",
+        "phoneVerified",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "PublicDirectoryProfile": {
+      "title": "PublicDirectoryProfile",
+      "description": "Public non-PII profile indexed by Firebase Auth UID for user search and chat verification.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "username": {
+          "type": "string",
+          "description": "Unique lowercase username.",
+          "minLength": 3,
+          "maxLength": 30,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Public display name.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "bio": {
+          "type": "string",
+          "description": "Public bio text.",
+          "minLength": 0,
+          "maxLength": 200
+        },
+        "avatarFallbackColor": {
+          "type": "string",
+          "description": "Avatar badge or color class.",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "emailVerified": {
+          "type": "boolean",
+          "description": "Whether the user has verified their email."
+        },
+        "phoneVerified": {
+          "type": "boolean",
+          "description": "Whether the user has verified their phone number via SMS OTP."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "uid",
+        "username",
+        "displayName",
+        "bio",
+        "avatarFallbackColor",
+        "emailVerified",
+        "phoneVerified",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UsernameReservation": {
+      "title": "UsernameReservation",
+      "description": "Atomic unique username registry mapping a unique lowercase username to a Firebase Auth UID.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID that owns this username.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "username": {
+          "type": "string",
+          "description": "Normalized unique username matching document ID.",
+          "minLength": 3,
+          "maxLength": 30,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Public display name of the user.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "bio": {
+          "type": "string",
+          "description": "Public bio or status.",
+          "minLength": 0,
+          "maxLength": 200
+        },
+        "avatarFallbackColor": {
+          "type": "string",
+          "description": "Avatar fallback color identifier.",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "uid",
+        "username",
+        "displayName",
+        "bio",
+        "avatarFallbackColor",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "ChatRoom": {
+      "title": "ChatRoom",
+      "description": "A direct conversation room between two verified, registered Firebase UIDs.",
+      "type": "object",
+      "properties": {
+        "chatId": {
+          "type": "string",
+          "description": "Deterministic chat ID formed from participant UIDs.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "participantOneUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the first participant.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "participantTwoUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the second participant.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "participantOneName": {
+          "type": "string",
+          "description": "Display name of the first participant.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "participantTwoName": {
+          "type": "string",
+          "description": "Display name of the second participant.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "participantOneUsername": {
+          "type": "string",
+          "description": "Unique username of the first participant.",
+          "minLength": 3,
+          "maxLength": 30,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "participantTwoUsername": {
+          "type": "string",
+          "description": "Unique username of the second participant.",
+          "minLength": 3,
+          "maxLength": 30,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "createdByUid": {
+          "type": "string",
+          "description": "UID of the participant who initiated the chat.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "lastMessageText": {
+          "type": "string",
+          "description": "Preview of the most recent message.",
+          "minLength": 1,
+          "maxLength": 500
+        },
+        "lastMessageSenderUid": {
+          "type": "string",
+          "description": "UID of the sender of the most recent message.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "lastMessageTime": {
+          "type": "string",
+          "description": "Formatted time of the last message.",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "chatId",
+        "participantOneUid",
+        "participantTwoUid",
+        "participantOneName",
+        "participantTwoName",
+        "participantOneUsername",
+        "participantTwoUsername",
+        "createdByUid",
+        "lastMessageText",
+        "lastMessageSenderUid",
+        "lastMessageTime",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "DirectMessage": {
+      "title": "DirectMessage",
+      "description": "A real-time message inside an authorized ChatRoom between two registered UIDs.",
+      "type": "object",
+      "properties": {
+        "chatId": {
+          "type": "string",
+          "description": "Parent ChatRoom document ID.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "senderUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the message sender.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "recipientUid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the message recipient.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "senderName": {
+          "type": "string",
+          "description": "Display name of the sender.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "senderUsername": {
+          "type": "string",
+          "description": "Username of the sender.",
+          "minLength": 3,
+          "maxLength": 30,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "text": {
+          "type": "string",
+          "description": "Message text content.",
+          "minLength": 1,
+          "maxLength": 2000
+        },
+        "messageType": {
+          "type": "string",
+          "description": "Type of message.",
+          "enum": ["text", "voice", "image", "file", "poll", "sticker"]
+        },
+        "displayTime": {
+          "type": "string",
+          "description": "Formatted time string.",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "isStarred": {
+          "type": "boolean",
+          "description": "Whether the message is starred."
+        },
+        "isPinned": {
+          "type": "boolean",
+          "description": "Whether the message is pinned."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "chatId",
+        "senderUid",
+        "recipientUid",
+        "senderName",
+        "senderUsername",
+        "text",
+        "messageType",
+        "displayTime",
+        "isStarred",
+        "isPinned",
         "createdAt",
         "updatedAt"
       ]
@@ -176,7 +522,7 @@
         "messageType": {
           "type": "string",
           "description": "Message type.",
-          "enum": ["text", "voice", "image", "file", "poll"]
+          "enum": ["text", "voice", "image", "file", "poll", "sticker"]
         },
         "displayTime": {
           "type": "string",
@@ -221,7 +567,23 @@
   "firestore": {
     "/users/{userId}": {
       "schema": { "$ref": "#/entities/UserProfile" },
-      "description": "Stores isolated user profile and wallpaper settings for each authenticated user."
+      "description": "Stores isolated private user profile and PII (email, phoneTag) accessible strictly by the owner."
+    },
+    "/directory/{userId}": {
+      "schema": { "$ref": "#/entities/PublicDirectoryProfile" },
+      "description": "Stores public non-PII profile indexed by Firebase UID for verified user lookup."
+    },
+    "/usernames/{username}": {
+      "schema": { "$ref": "#/entities/UsernameReservation" },
+      "description": "Enforces atomic username uniqueness and maps @username to a registered Firebase UID."
+    },
+    "/chats/{chatId}": {
+      "schema": { "$ref": "#/entities/ChatRoom" },
+      "description": "Stores 1-on-1 chat rooms between two real registered UIDs; accessible only to the two participants."
+    },
+    "/chats/{chatId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/DirectMessage" },
+      "description": "Stores real-time direct messages inside a chat room; accessible only to the two authorized participants."
     },
     "/users/{userId}/contacts/{contactId}": {
       "schema": { "$ref": "#/entities/SavedContact" },

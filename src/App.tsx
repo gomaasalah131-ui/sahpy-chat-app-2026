@@ -33,6 +33,7 @@ import {
   Radio,
   Smartphone,
   LogIn,
+  LogOut,
   Database,
   Users,
   Film,
@@ -75,6 +76,16 @@ import {
   InputGroup,
 } from './components/PhoneRegistrationScreen';
 import {
+  auth,
+  logoutFromFirebase,
+  subscribeToAuthChanges,
+  fetchUserProfileByUid,
+  findRegisteredUserInFirestore,
+  ensureAuthorizedChatRoomInFirestore,
+  sendDirectMessageToAuthorizedChat,
+  subscribeToAuthorizedChatMessages,
+  getDeterministicChatId,
+  PublicDirectoryUser,
   syncUserToFirestore,
   syncContactToFirestore,
   sendMessageToFirestore,
@@ -418,6 +429,9 @@ export default function App() {
   const [isProfileOpen, setIsProfileOpen] = useState(false);
 
   // Current User Profile State
+  const [currentUserUid, setCurrentUserUid] = useState<string>(
+    () => localStorage.getItem('nabd_user_uid') || ''
+  );
   const [userName, setUserName] = useState(() => {
     const raw = localStorage.getItem('nabd_user_name') || '𝔼𝕟𝕘𝕚𝕟𝕖𝕖𝕣 𝕊𝔸𝕃𝔸ℍ 𝔾𝕆𝕄𝔸𝔸';
     return raw.replace(/الديزينر انجينير\s*/g, '').trim() || '𝔼𝕟𝕘𝕚𝕟𝕖𝕖𝕣 𝕊𝔸𝕃𝔸ℍ 𝔾𝕆𝕄𝔸𝔸';
@@ -435,6 +449,8 @@ export default function App() {
   const [userAvatar, setUserAvatar] = useState(
     () => localStorage.getItem('nabd_user_avatar') || ahmedAvatar
   );
+  const [sidebarFirestoreMatch, setSidebarFirestoreMatch] =
+    useState<PublicDirectoryUser | null>(null);
 
   // Toast Notification
   const [toastMessage, setToastMessage] = useState<string | null>(null);
@@ -706,16 +722,64 @@ export default function App() {
     []
   );
 
+  // Sync with Firebase Authentication Session & Cloud Firestore
+  useEffect(() => {
+    const unsubAuth = subscribeToAuthChanges(async (fbUser) => {
+      if (fbUser && fbUser.emailVerified) {
+        setCurrentUserUid(fbUser.uid);
+        localStorage.setItem('nabd_user_uid', fbUser.uid);
+        const profile = await fetchUserProfileByUid(fbUser.uid);
+        if (profile) {
+          setUserName(profile.displayName || fbUser.displayName || userName);
+          if (profile.phoneTag) setUserPhone(profile.phoneTag);
+          if (profile.username) setUserUsername(profile.username);
+          if (profile.bio) setUserBio(profile.bio);
+          setFirestoreConnected(true);
+        }
+      } else if (!fbUser) {
+        setCurrentUserUid('');
+        localStorage.removeItem('nabd_user_uid');
+      }
+    });
+    return () => unsubAuth();
+  }, [userName]);
+
+  // Search Firestore when typing in sidebar search box
+  useEffect(() => {
+    const q = searchQuery.trim();
+    if (q.length < 3) {
+      setSidebarFirestoreMatch(null);
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(async () => {
+      const found = await findRegisteredUserInFirestore(q);
+      if (!cancelled) {
+        if (found && found.uid !== (currentUserUid || auth.currentUser?.uid)) {
+          setSidebarFirestoreMatch(found);
+        } else {
+          setSidebarFirestoreMatch(null);
+        }
+      }
+    }, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [searchQuery, currentUserUid]);
+
   // Sync with Firebase Cloud Firestore
   useEffect(() => {
-    syncUserToFirestore({
-      name: userName,
-      phone: userPhone,
-      bio: userBio,
-      avatar: userAvatar,
-    }).then(() => {
-      setFirestoreConnected(true);
-    });
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      syncUserToFirestore({
+        name: userName,
+        phone: userPhone,
+        bio: userBio,
+        avatar: userAvatar,
+      }).then(() => {
+        setFirestoreConnected(true);
+      });
+    }
 
     const unsubUsers = subscribeToFirestoreUsers((cloudUsers) => {
       setFirestoreConnected(true);
@@ -949,6 +1013,55 @@ export default function App() {
   const selectedContact =
     contacts.find((c) => c.id === selectedContactId) || contacts[0];
 
+  // Subscribe to authorized Firestore chat room messages when chatting with a registered user
+  useEffect(() => {
+    const myUid = currentUserUid || auth.currentUser?.uid;
+    const targetUid = selectedContact?.uid;
+    if (!myUid || !targetUid || selectedContact?.isGroup || myUid === targetUid) {
+      return;
+    }
+    const chatId =
+      selectedContact?.chatId || getDeterministicChatId(myUid, targetUid);
+
+    const unsub = subscribeToAuthorizedChatMessages(chatId, (cloudMsgs) => {
+      setFirestoreConnected(true);
+      setContacts((prev) =>
+        prev.map((c) => {
+          if (c.id !== selectedContact.id && c.uid !== targetUid) return c;
+          const existingIds = new Set(c.messages.map((m) => m.id));
+          const additions: Message[] = [];
+          cloudMsgs.forEach((cm) => {
+            if (!existingIds.has(cm.id)) {
+              const isFromMe = cm.senderUid === myUid;
+              additions.push({
+                id: cm.id,
+                senderId: isFromMe ? 'me' : c.id,
+                senderUid: cm.senderUid,
+                senderName: cm.senderName,
+                text: cm.text,
+                timestamp: new Date(cm.createdAt).toLocaleTimeString('ar-EG', {
+                  hour: '2-digit',
+                  minute: '2-digit',
+                }),
+                status: 'read',
+                type: cm.type || 'text',
+                reactions: [],
+              });
+            }
+          });
+          if (additions.length === 0) return c;
+          return {
+            ...c,
+            chatId,
+            messages: [...c.messages, ...additions],
+          };
+        })
+      );
+    });
+
+    return () => unsub();
+  }, [currentUserUid, selectedContact?.id, selectedContact?.uid, selectedContact?.chatId, selectedContact?.isGroup]);
+
   // Reset groupSenderMemberId when switching contacts
   useEffect(() => {
     setGroupSenderMemberId('me');
@@ -1039,59 +1152,116 @@ export default function App() {
     const qLower = qRaw.toLowerCase();
     const qDigits = normalizeDigits(qRaw);
     const qUser = normalizeUsername(qRaw);
+    const myUid = currentUserUid || auth.currentUser?.uid || '';
 
-    return registeredUsers.filter((u) => {
+    const results: RegisteredDirectoryUser[] = [];
+
+    if (sidebarFirestoreMatch && sidebarFirestoreMatch.uid !== myUid) {
+      const alreadyInContacts = contacts.some(
+        (c) =>
+          !c.isGroup &&
+          (c.uid === sidebarFirestoreMatch.uid ||
+            c.id === sidebarFirestoreMatch.uid ||
+            normalizeUsername(c.username) ===
+              normalizeUsername(sidebarFirestoreMatch.username))
+      );
+      if (!alreadyInContacts) {
+        results.push({
+          id: sidebarFirestoreMatch.uid,
+          uid: sidebarFirestoreMatch.uid,
+          name: sidebarFirestoreMatch.displayName,
+          phone: sidebarFirestoreMatch.phoneVerified
+            ? 'مؤكد عبر OTP'
+            : 'مسجل في Firestore',
+          username: sidebarFirestoreMatch.username,
+          bio: sidebarFirestoreMatch.bio || 'مستخدم موثق في SAHPY-CHAT ✨',
+          avatar: omarAvatar,
+          emailVerified: sidebarFirestoreMatch.emailVerified,
+          phoneVerified: sidebarFirestoreMatch.phoneVerified,
+          isOnline: true,
+          lastSeen: 'موثق في Firestore',
+        });
+      }
+    }
+
+    registeredUsers.forEach((u) => {
+      const uUid = u.uid || u.id;
+      if (myUid && uUid === myUid) return;
+      if (results.some((r) => (r.uid || r.id) === uUid)) return;
+
       const uDigits = u.normalizedPhone || normalizeDigits(u.phone);
       const uUser = normalizeUsername(u.username);
       const alreadyInContacts = contacts.some(
         (c) =>
           !c.isGroup &&
-          ((uDigits.length >= 7 && normalizeDigits(c.phone) === uDigits) ||
+          (c.uid === uUid ||
+            c.id === uUid ||
+            (uDigits.length >= 7 && normalizeDigits(c.phone) === uDigits) ||
             (uUser.length >= 3 && normalizeUsername(c.username) === uUser))
       );
-      if (alreadyInContacts) return false;
+      if (alreadyInContacts) return;
 
+      const matchesUid = uUid.toLowerCase() === qLower;
       const matchesPhone =
         (qDigits.length >= 3 && uDigits.includes(qDigits)) ||
         (u.phone || '').toLowerCase().includes(qLower);
       const matchesUser = qUser.length >= 2 && uUser.includes(qUser);
       const matchesName = (u.name || '').toLowerCase().includes(qLower);
-      return matchesPhone || matchesUser || matchesName;
+      if (matchesUid || matchesPhone || matchesUser || matchesName) {
+        results.push(u);
+      }
     });
-  }, [searchQuery, registeredUsers, contacts]);
 
-  // Complete Registration / Login Handler (Gmail + Phone + Username + Profile Avatar)
+    return results;
+  }, [searchQuery, registeredUsers, contacts, sidebarFirestoreMatch, currentUserUid]);
+
+  // Complete Registration / Login Handler (Firebase Auth UID + Gmail + Phone + Username + Profile Avatar)
   const handleCompleteRegistration = async ({
+    uid,
     name,
     phone,
     username,
     email,
     bio,
     avatar,
+    emailVerified,
+    phoneVerified,
     stayOnScreen,
   }: {
+    uid?: string;
     name: string;
     phone: string;
     username: string;
     email?: string;
     bio: string;
     avatar?: string;
+    emailVerified?: boolean;
+    phoneVerified?: boolean;
     stayOnScreen?: boolean;
   }) => {
     const cleanUser = normalizeUsername(username) || 'salah_gomaa';
     const finalAvatar = avatar || userAvatar || ahmedAvatar;
+    const effectiveUid = uid || auth.currentUser?.uid || currentUserUid || '';
+    if (effectiveUid) {
+      setCurrentUserUid(effectiveUid);
+      localStorage.setItem('nabd_user_uid', effectiveUid);
+    }
+
     let data: { users?: RegisteredDirectoryUser[]; error?: string } = {};
     try {
       const res = await fetch('/api/auth/register', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          uid: effectiveUid,
           name,
           phone,
           username: cleanUser,
           email,
           bio,
           avatar: finalAvatar,
+          emailVerified: emailVerified ?? true,
+          phoneVerified: phoneVerified ?? false,
         }),
       });
       const contentType = res.headers.get('content-type') || '';
@@ -1113,19 +1283,22 @@ export default function App() {
     localStorage.setItem('nabd_user_bio', bio);
     localStorage.setItem('nabd_user_avatar', finalAvatar);
 
-    syncUserToFirestore({
-      name,
-      phone,
-      bio,
-      avatar: finalAvatar,
-    });
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      syncUserToFirestore({
+        name,
+        phone,
+        bio,
+        avatar: finalAvatar,
+      });
+    }
 
     if (Array.isArray(data.users)) {
       setRegisteredUsers(data.users);
       mergeUsersIntoContacts(data.users, phone);
-    } else {
+    } else if (effectiveUid) {
       const fallbackEntry: RegisteredDirectoryUser = {
-        id: `user-${Date.now()}`,
+        id: effectiveUid,
+        uid: effectiveUid,
         name,
         phone,
         normalizedPhone: normalizeDigits(phone),
@@ -1134,13 +1307,15 @@ export default function App() {
         email,
         bio,
         avatar: finalAvatar,
+        emailVerified: emailVerified ?? true,
+        phoneVerified: phoneVerified ?? false,
         isOnline: true,
         lastSeen: 'متصل الآن',
       };
       setRegisteredUsers((prev) => {
         const exists = prev.some(
           (u) =>
-            u.normalizedPhone === fallbackEntry.normalizedPhone ||
+            (u.uid || u.id) === effectiveUid ||
             normalizeUsername(u.username) === cleanUser
         );
         return exists ? prev : [fallbackEntry, ...prev];
@@ -1160,34 +1335,79 @@ export default function App() {
     if (!stayOnScreen) {
       setViewMode('chat');
       triggerToast(
-        `مرحباً ${name}! تم تسجيل الدخول بنجاح (${email || phone} • @${cleanUser}) في SAHPY-CHAT ✅`
+        `مرحباً ${name}! تم تسجيل الدخول بنجاح (@${cleanUser}) في SAHPY-CHAT ✅`
       );
     }
   };
 
-  // Start chat with a user from directory
-  const handleStartChatWithDirectoryUser = (user: RegisteredDirectoryUser) => {
+  // Real Logout Handler
+  const handleRealLogout = async () => {
+    await logoutFromFirebase();
+    setCurrentUserUid('');
+    localStorage.removeItem('nabd_user_uid');
+    setViewMode('registration');
+    triggerToast('تم تسجيل الخروج الآمن من حسابك في SAHPY-CHAT 🔒');
+  };
+
+  // Start chat with a verified registered user from directory / Firestore
+  const handleStartChatWithDirectoryUser = async (user: RegisteredDirectoryUser) => {
+    const myUid = currentUserUid || auth.currentUser?.uid || '';
+    if (!myUid && !auth.currentUser) {
+      triggerToast('يجب تسجيل الدخول وتأكيد هويتك أولاً قبل بدء محادثة.');
+      setViewMode('registration');
+      return;
+    }
+
+    let targetUid = user.uid || user.id || '';
+    if (!targetUid && user.username) {
+      const found = await findRegisteredUserInFirestore(user.username);
+      if (found) targetUid = found.uid;
+    }
+    if (!targetUid) {
+      triggerToast(
+        'لا يمكن إنشاء محادثة مع مستخدم غير مسجل فعلياً في قاعدة بيانات Firestore.'
+      );
+      return;
+    }
+
     const uNorm = user.normalizedPhone || normalizeDigits(user.phone);
     const existing = contacts.find(
       (c) =>
         !c.isGroup &&
-        (normalizeDigits(c.phone) === uNorm ||
-          normalizeDigits(c.phone).endsWith(uNorm.slice(-9)) ||
+        (c.uid === targetUid ||
+          c.id === targetUid ||
+          (uNorm.length >= 7 && normalizeDigits(c.phone) === uNorm) ||
           (user.username &&
             normalizeUsername(c.username) === normalizeUsername(user.username)))
     );
 
+    const chatId =
+      myUid && targetUid && myUid !== targetUid
+        ? getDeterministicChatId(myUid, targetUid)
+        : undefined;
+
+    if (myUid && targetUid && myUid !== targetUid) {
+      ensureAuthorizedChatRoomInFirestore({
+        myUid,
+        otherUid: targetUid,
+        myUsername: userUsername,
+        otherUsername: user.username || normalizeUsername(user.name),
+      }).catch(() => {});
+    }
+
     if (existing) {
       setSelectedContactId(existing.id);
     } else {
-      const newId = user.id || `contact-${uNorm}`;
+      const newId = targetUid;
       const newContact: Contact = {
         id: newId,
+        uid: targetUid,
+        chatId,
         name: user.name,
         phone: user.phone,
         username: user.username || normalizeUsername(user.name),
         avatar: user.avatar || omarAvatar,
-        roleOrBio: user.bio || 'مسجل في SAHPY-CHAT ✨',
+        roleOrBio: user.bio || 'مستخدم مسجل وموثق في SAHPY-CHAT ✨',
         isOnline: true,
         lastSeen: 'متصل الآن',
         unreadCount: 0,
@@ -1196,17 +1416,7 @@ export default function App() {
         isBlocked: false,
         customWallpaper: 'aurora-borealis',
         sharedMedia: [],
-        messages: [
-          {
-            id: `msg-init-${Date.now()}`,
-            senderId: newId,
-            text: `مرحباً! حسابي المسجل هو @${user.username || normalizeUsername(user.name)} ورقمي (${user.phone}) 👋`,
-            timestamp: 'الآن',
-            status: 'read',
-            type: 'text',
-            reactions: [],
-          },
-        ],
+        messages: [],
       };
       setContacts((prev) => [newContact, ...prev]);
       syncContactToFirestore(newContact);
@@ -1391,10 +1601,17 @@ export default function App() {
     );
   };
 
-  // Send Text Message (Supports both 1-on-1 AND Group Chat!)
+  // Send Text Message (Supports both 1-on-1 AND Group Chat! Requires verified sender)
   const handleSendMessage = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
     if (!inputText.trim() || !selectedContact || selectedContact.isBlocked) return;
+
+    const myUid = currentUserUid || auth.currentUser?.uid || '';
+    if (!myUid && !auth.currentUser) {
+      triggerToast('يجب تسجيل الدخول وتأكيد هويتك أولاً قبل إرسال الرسائل.');
+      setViewMode('registration');
+      return;
+    }
 
     const nowTime = new Date().toLocaleTimeString('ar-EG', {
       hour: '2-digit',
@@ -1476,12 +1693,29 @@ export default function App() {
       type: 'text',
     });
 
+    if (!isGroupChat && myUid && selectedContact.uid && myUid !== selectedContact.uid) {
+      sendDirectMessageToAuthorizedChat({
+        senderUid: myUid,
+        recipientUid: selectedContact.uid,
+        senderName: effectiveSenderName,
+        text: newMsg.text,
+        type: 'text',
+      }).catch(() => {});
+    }
+
     simulateMessageLifecycle(targetId, newMsgId);
   };
 
   // Send Sticker from Sticker Pack (Supports 1-on-1 and Group Chats!)
   const handleSendSticker = (sticker: StickerItem) => {
     if (!selectedContact || selectedContact.isBlocked) return;
+
+    const myUid = currentUserUid || auth.currentUser?.uid || '';
+    if (!myUid && !auth.currentUser) {
+      triggerToast('يجب تسجيل الدخول وتأكيد هويتك أولاً قبل إرسال الملصقات.');
+      setViewMode('registration');
+      return;
+    }
 
     const nowTime = new Date().toLocaleTimeString('ar-EG', {
       hour: '2-digit',
@@ -1575,6 +1809,16 @@ export default function App() {
       timestamp: nowTime,
       type: 'sticker',
     });
+
+    if (!isGroupChat && myUid && selectedContact.uid && myUid !== selectedContact.uid) {
+      sendDirectMessageToAuthorizedChat({
+        senderUid: myUid,
+        recipientUid: selectedContact.uid,
+        senderName: effectiveSenderName,
+        text: stickerSummaryText,
+        type: 'sticker',
+      }).catch(() => {});
+    }
 
     simulateMessageLifecycle(targetId, newMsgId);
   };
@@ -2127,48 +2371,117 @@ export default function App() {
     triggerToast('تم حذف الحالة اليومية بنجاح 🗑️');
   };
 
-  // Create New Contact by Phone Number & Username
-  const handleCreateNewContact = (
+  // Create New Contact ONLY for Registered Users in Firestore (Prevents random/fake contacts)
+  const handleCreateNewContact = async (
     name: string,
     phone: string,
     roleOrBio: string,
     avatar?: string,
-    username?: string
+    username?: string,
+    targetUid?: string
   ) => {
-    const cleanUser = normalizeUsername(username) || normalizeUsername(name);
-    const newId = `contact-${Date.now()}`;
+    const myUid = currentUserUid || auth.currentUser?.uid || '';
+    if (!myUid && !auth.currentUser) {
+      triggerToast('يجب تسجيل الدخول وتأكيد هويتك أولاً قبل إنشاء محادثة.');
+      setViewMode('registration');
+      return;
+    }
+
+    let resolvedUid = targetUid || '';
+    let resolvedUsername = normalizeUsername(username);
+    let resolvedName = name;
+
+    if (!resolvedUid) {
+      const found = await findRegisteredUserInFirestore(
+        resolvedUsername || phone || name
+      );
+      if (found) {
+        resolvedUid = found.uid;
+        resolvedUsername = found.username;
+        resolvedName = found.displayName || name;
+      } else {
+        const localReg = registeredUsers.find(
+          (u) =>
+            normalizeUsername(u.username) === resolvedUsername ||
+            (u.uid && u.uid === (username || phone))
+        );
+        if (localReg) {
+          resolvedUid = localReg.uid || localReg.id;
+          resolvedUsername = normalizeUsername(localReg.username);
+          resolvedName = localReg.name || name;
+        }
+      }
+    }
+
+    if (!resolvedUid) {
+      triggerToast(
+        'لا يُسمح بإنشاء محادثة مع اسم عشوائي أو مستخدم غير موجود في Firestore.'
+      );
+      return;
+    }
+
+    if (myUid && resolvedUid === myUid) {
+      triggerToast('لا يمكنك إنشاء محادثة مع نفسك.');
+      return;
+    }
+
+    const existing = contacts.find(
+      (c) =>
+        !c.isGroup &&
+        (c.uid === resolvedUid ||
+          c.id === resolvedUid ||
+          (resolvedUsername &&
+            normalizeUsername(c.username) === resolvedUsername))
+    );
+
+    if (existing) {
+      setSelectedContactId(existing.id);
+      setMobileShowChat(true);
+      return;
+    }
+
+    const chatId =
+      myUid && resolvedUid
+        ? getDeterministicChatId(myUid, resolvedUid)
+        : undefined;
+
+    if (myUid && resolvedUid) {
+      await ensureAuthorizedChatRoomInFirestore({
+        myUid,
+        otherUid: resolvedUid,
+        myUsername: userUsername,
+        otherUsername: resolvedUsername || normalizeUsername(resolvedName),
+      });
+    }
+
+    const cleanUser = resolvedUsername || normalizeUsername(resolvedName);
+    const newId = resolvedUid;
     const newContact: Contact = {
       id: newId,
-      name,
+      uid: resolvedUid,
+      chatId,
+      name: resolvedName,
       phone,
       username: cleanUser,
       avatar: avatar || omarAvatar,
       roleOrBio,
       isOnline: true,
-      lastSeen: 'متصل الآن',
+      lastSeen: 'موثق في Firestore',
       unreadCount: 0,
       isPinned: true,
       isMuted: false,
       isBlocked: false,
       customWallpaper: 'aurora-borealis',
       sharedMedia: [],
-      messages: [
-        {
-          id: `welcome-${Date.now()}`,
-          senderId: newId,
-          text: `أهلاً بك! تم بدء محادثة جديدة عبر SAHPY-CHAT (@${cleanUser} • ${phone}) 👋✨`,
-          timestamp: 'الآن',
-          status: 'read',
-          type: 'text',
-          reactions: [],
-        },
-      ],
+      messages: [],
     };
     setContacts((prev) => [newContact, ...prev]);
     syncContactToFirestore(newContact);
     setSelectedContactId(newId);
     setMobileShowChat(true);
-    triggerToast(`تمت إضافة "${name}" (@${cleanUser} • ${phone}) وبدء المحادثة 🎉`);
+    triggerToast(
+      `تم بدء محادثة موثقة مع "${resolvedName}" (@${cleanUser}) عبر Firestore 🔒`
+    );
   };
 
   // Save User Profile
@@ -2230,6 +2543,10 @@ export default function App() {
 
   // Show Aurora Sign Up Screen if viewMode === 'registration'
   if (viewMode === 'registration') {
+    const canEnterProtectedChats = Boolean(
+      (currentUserUid || auth.currentUser?.uid) &&
+        (auth.currentUser ? auth.currentUser.emailVerified : true)
+    );
     return (
       <PhoneRegistrationScreen
         wallpaperConfig={wallpaperConfig}
@@ -2241,7 +2558,9 @@ export default function App() {
         registeredUsers={registeredUsers}
         onCompleteRegistration={handleCompleteRegistration}
         onStartChatWithUser={handleStartChatWithDirectoryUser}
-        onBackToChats={() => setViewMode('chat')}
+        onBackToChats={
+          canEnterProtectedChats ? () => setViewMode('chat') : undefined
+        }
       />
     );
   }
@@ -2330,10 +2649,18 @@ export default function App() {
               <button
                 onClick={() => setViewMode('registration')}
                 className="px-2.5 py-2 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-white text-[11px] font-bold flex items-center gap-1 transition-all cursor-pointer"
-                title="واجهة التسجيل والبحث بالرقم واليوزر"
+                title="إدارة الحساب والتحقق"
               >
                 <LogIn className="w-3.5 h-3.5" />
-                <span className="hidden sm:inline">التسجيل</span>
+                <span className="hidden sm:inline">الحساب</span>
+              </button>
+
+              <button
+                onClick={handleRealLogout}
+                className="p-2 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 text-rose-300 transition-all cursor-pointer"
+                title="تسجيل الخروج الآمن من الحساب"
+              >
+                <LogOut className="w-3.5 h-3.5" />
               </button>
 
               <button
@@ -2632,32 +2959,13 @@ export default function App() {
                 )}
 
                 <div className="flex flex-col gap-2">
-                  {searchQuery.trim().length >= 3 ? (
-                    <button
-                      onClick={() => {
-                        const isUsernameSearch = searchQuery.trim().startsWith('@');
-                        handleCreateNewContact(
-                          `مستخدم (${searchQuery.trim()})`,
-                          isUsernameSearch ? '+20 100 000 0000' : searchQuery.trim(),
-                          'مضاف عبر البحث المباشر ✨',
-                          undefined,
-                          isUsernameSearch ? searchQuery.trim() : undefined
-                        );
-                        setSearchQuery('');
-                      }}
-                      className="w-full px-4 py-2.5 rounded-xl bg-emerald-500 text-slate-950 text-xs font-bold hover:bg-emerald-400 transition-colors cursor-pointer"
-                    >
-                      مراسلة "{searchQuery.trim()}" فوراً
-                    </button>
-                  ) : (
-                    <button
-                      onClick={() => setIsNewChatOpen(true)}
-                      className="w-full px-4 py-2.5 rounded-xl bg-emerald-500 text-slate-950 text-xs font-bold hover:bg-emerald-400 transition-colors flex items-center justify-center gap-1.5 cursor-pointer shadow-lg shadow-emerald-500/15"
-                    >
-                      <UserPlus className="w-4 h-4" />
-                      <span>ابحث عن صديق بالرقم أو اليوزر</span>
-                    </button>
-                  )}
+                  <button
+                    onClick={() => setIsNewChatOpen(true)}
+                    className="w-full px-4 py-2.5 rounded-xl bg-emerald-500 text-slate-950 text-xs font-bold hover:bg-emerald-400 transition-colors flex items-center justify-center gap-1.5 cursor-pointer shadow-lg shadow-emerald-500/15"
+                  >
+                    <UserPlus className="w-4 h-4" />
+                    <span>ابحث عن مستخدم مسجل (@username أو UID)</span>
+                  </button>
 
                   <button
                     onClick={() => setIsCreateGroupOpen(true)}

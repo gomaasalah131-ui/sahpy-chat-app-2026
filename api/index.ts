@@ -10,6 +10,7 @@ const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 
 export interface RegisteredUser {
   id: string;
+  uid: string;
   name: string;
   phone: string;
   normalizedPhone: string;
@@ -18,6 +19,8 @@ export interface RegisteredUser {
   email?: string;
   bio: string;
   avatar: string;
+  emailVerified: boolean;
+  phoneVerified: boolean;
   isOnline: boolean;
   lastSeen: string;
   createdAt: string;
@@ -25,6 +28,8 @@ export interface RegisteredUser {
 
 export interface ChatMessagePayload {
   id: string;
+  senderUid?: string;
+  recipientUid?: string;
   senderPhone: string;
   senderName: string;
   senderAvatar?: string;
@@ -116,7 +121,10 @@ function normalizeUsername(str?: string): string {
     .trim()
     .toLowerCase()
     .replace(/^@+/, '')
-    .replace(/\s+/g, '_');
+    .replace(/[^a-z0-9_]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 30);
 }
 
 const DEMO_USER_IDS = new Set([
@@ -125,25 +133,8 @@ const DEMO_USER_IDS = new Set([
   'user-layla',
   'user-omar',
   'user-nour',
+  'user-salah-gomaa',
 ]);
-
-const DEFAULT_USERS: RegisteredUser[] = [
-  {
-    id: 'user-salah-gomaa',
-    name: '𝔼𝕟𝕘𝕚𝕟𝕖𝕖𝕣 𝕊𝔸𝕃𝔸ℍ 𝔾𝕆𝕄𝔸𝔸',
-    phone: '+20 109 876 5432',
-    normalizedPhone: '201098765432',
-    username: 'salah_gomaa',
-    normalizedUsername: 'salah_gomaa',
-    email: 'gomaasalah131@gmail.com',
-    bio: 'Lead Architect & Founder — SAHPY-CHAT ✨',
-    avatar:
-      'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=240&auto=format&fit=crop&q=80',
-    isOnline: true,
-    lastSeen: 'متصل الآن',
-    createdAt: new Date().toISOString(),
-  },
-];
 
 function pruneExpiredStories(stories: StoryPayload[]): StoryPayload[] {
   const now = Date.now();
@@ -159,7 +150,17 @@ function loadStore(): ServerStore {
         if (!Array.isArray(parsed.groups)) parsed.groups = [];
         if (!Array.isArray(parsed.stories)) parsed.stories = [];
         parsed.stories = pruneExpiredStories(parsed.stories);
-        parsed.users = parsed.users.filter((u) => !DEMO_USER_IDS.has(u.id));
+        parsed.users = parsed.users
+          .filter((u) => !DEMO_USER_IDS.has(u.id) && Boolean(u.uid || u.id))
+          .map((u) => ({
+            ...u,
+            uid: u.uid || u.id,
+            id: u.uid || u.id,
+            username: normalizeUsername(u.username),
+            normalizedUsername: normalizeUsername(u.username),
+            emailVerified: Boolean(u.emailVerified),
+            phoneVerified: Boolean(u.phoneVerified),
+          }));
         return parsed;
       }
     }
@@ -167,7 +168,7 @@ function loadStore(): ServerStore {
     console.error('Failed to read store in serverless function:', err);
   }
   const initial: ServerStore = {
-    users: [...DEFAULT_USERS],
+    users: [],
     messages: [],
     groups: [],
     stories: [],
@@ -185,12 +186,60 @@ function saveStore(store: ServerStore) {
   }
 }
 
+function toPublicUser(u: RegisteredUser) {
+  return {
+    id: u.uid || u.id,
+    uid: u.uid || u.id,
+    name: u.name,
+    phone: u.phone,
+    normalizedPhone: u.normalizedPhone,
+    username: u.username,
+    normalizedUsername: u.normalizedUsername,
+    bio: u.bio,
+    avatar: u.avatar,
+    emailVerified: u.emailVerified,
+    phoneVerified: u.phoneVerified,
+    isOnline: u.isOnline,
+    lastSeen: u.lastSeen,
+    createdAt: u.createdAt,
+  };
+}
+
 const app = express();
 app.use(express.json({ limit: '30mb' }));
 
+app.get('/api/users/check-username', (req, res) => {
+  const store = loadStore();
+  const cleanUser = normalizeUsername(String(req.query.username || ''));
+  if (!cleanUser || cleanUser.length < 3) {
+    res.json({ taken: false });
+    return;
+  }
+  const found = store.users.find((u) => u.normalizedUsername === cleanUser);
+  res.json({
+    taken: Boolean(found),
+    uid: found ? found.uid || found.id : undefined,
+  });
+});
+
+app.get('/api/auth/resolve-username', (req, res) => {
+  const store = loadStore();
+  const cleanUser = normalizeUsername(String(req.query.username || ''));
+  if (!cleanUser) {
+    res.status(400).json({ error: 'يرجى إدخال اسم المستخدم.' });
+    return;
+  }
+  const found = store.users.find((u) => u.normalizedUsername === cleanUser);
+  if (!found || !found.email) {
+    res.status(404).json({ error: 'USERNAME_NOT_FOUND' });
+    return;
+  }
+  res.json({ email: found.email, uid: found.uid || found.id });
+});
+
 app.get('/api/users', (_req, res) => {
   const store = loadStore();
-  res.json({ users: store.users });
+  res.json({ users: store.users.map(toPublicUser) });
 });
 
 app.get('/api/users/search', (req, res) => {
@@ -205,79 +254,124 @@ app.get('/api/users/search', (req, res) => {
   const qUser = normalizeUsername(q);
 
   const matched = store.users.filter((u) => {
-    const nameMatch = u.name.toLowerCase().includes(qLower);
-    const rawPhoneMatch = u.phone.toLowerCase().includes(qLower);
-    const emailMatch = (u.email || '').toLowerCase().includes(qLower);
+    const uidMatch = (u.uid || u.id).toLowerCase() === qLower;
     const usernameMatch =
-      u.username?.toLowerCase().includes(qLower) ||
-      (qUser.length > 0 && u.normalizedUsername?.includes(qUser));
+      u.username?.toLowerCase() === qLower.replace(/^@+/, '') ||
+      (qUser.length >= 2 && u.normalizedUsername?.includes(qUser));
     const digitMatch =
-      qDigits.length >= 2 &&
+      qDigits.length >= 4 &&
       (u.normalizedPhone.includes(qDigits) ||
         qDigits.includes(u.normalizedPhone));
-    return (
-      nameMatch || rawPhoneMatch || emailMatch || usernameMatch || digitMatch
-    );
+    const nameMatch = qLower.length >= 3 && u.name.toLowerCase().includes(qLower);
+    return uidMatch || usernameMatch || digitMatch || nameMatch;
   });
 
-  res.json({ users: matched });
+  res.json({ users: matched.map(toPublicUser) });
 });
 
 app.post('/api/auth/register', (req, res) => {
   const store = loadStore();
-  const { name, phone, username, email, bio, avatar } = req.body || {};
+  const {
+    uid,
+    name,
+    phone,
+    username,
+    email,
+    bio,
+    avatar,
+    emailVerified,
+    phoneVerified,
+  } = req.body || {};
+
+  if (!uid || typeof uid !== 'string') {
+    res.status(400).json({
+      error: 'يجب التسجيل عبر Firebase Authentication أولاً للحصول على UID حقيقي.',
+    });
+    return;
+  }
+
   const cleanEmail = String(email || '').trim().toLowerCase();
-  const cleanPhone = String(phone || '+20 109 876 5432').trim();
-  const norm = normalizeDigits(cleanPhone) || '201098765432';
+  const cleanPhone = String(phone || '').trim();
+  const norm = normalizeDigits(cleanPhone);
+  const cleanUser = normalizeUsername(username);
 
-  const cleanUser =
-    normalizeUsername(username) ||
-    (cleanEmail ? normalizeUsername(cleanEmail.split('@')[0]) : '') ||
-    normalizeUsername(name) ||
-    `user_${norm.slice(-4)}`;
+  if (!cleanUser || cleanUser.length < 3) {
+    res.status(400).json({
+      error: 'اسم المستخدم (Username) مطلوب ويجب أن يتكون من 3 أحرف على الأقل.',
+    });
+    return;
+  }
 
-  const existing = store.users.find(
-    (u) =>
-      (cleanEmail && (u.email || '').toLowerCase() === cleanEmail) ||
-      u.normalizedPhone === norm ||
-      (norm.length >= 9 &&
-        (u.normalizedPhone.endsWith(norm.slice(-9)) ||
-          norm.endsWith(u.normalizedPhone.slice(-9)))) ||
-      (cleanUser && u.normalizedUsername === cleanUser)
+  const duplicateUsername = store.users.find(
+    (u) => u.normalizedUsername === cleanUser && u.uid !== uid && u.id !== uid
   );
+  if (duplicateUsername) {
+    res.status(409).json({
+      error: 'USERNAME_TAKEN',
+      message: 'اسم المستخدم مستخدم بالفعل من قبل حساب آخر.',
+    });
+    return;
+  }
+
+  if (cleanEmail) {
+    const duplicateEmail = store.users.find(
+      (u) =>
+        (u.email || '').toLowerCase() === cleanEmail &&
+        u.uid !== uid &&
+        u.id !== uid
+    );
+    if (duplicateEmail) {
+      res.status(409).json({
+        error: 'EMAIL_ALREADY_REGISTERED',
+        message: 'البريد الإلكتروني مسجل بالفعل لحساب آخر.',
+      });
+      return;
+    }
+  }
+
+  const existing = store.users.find((u) => u.uid === uid || u.id === uid);
 
   if (existing) {
+    existing.uid = uid;
+    existing.id = uid;
     if (name && String(name).trim()) existing.name = String(name).trim();
     if (cleanPhone) {
       existing.phone = cleanPhone;
       existing.normalizedPhone = norm;
     }
-    if (username && String(username).trim()) {
-      existing.username = cleanUser;
-      existing.normalizedUsername = cleanUser;
-    }
-    if (email && String(email).trim()) existing.email = String(email).trim();
+    existing.username = cleanUser;
+    existing.normalizedUsername = cleanUser;
+    if (cleanEmail) existing.email = cleanEmail;
     if (bio && String(bio).trim()) existing.bio = String(bio).trim();
     if (avatar) existing.avatar = avatar;
+    existing.emailVerified = Boolean(emailVerified ?? existing.emailVerified);
+    existing.phoneVerified = Boolean(phoneVerified ?? existing.phoneVerified);
     existing.isOnline = true;
     existing.lastSeen = 'متصل الآن';
     saveStore(store);
-    res.json({ user: existing, users: store.users, isNew: false });
+    res.json({
+      user: toPublicUser(existing),
+      users: store.users.map(toPublicUser),
+      isNew: false,
+    });
     return;
   }
 
   const newUser: RegisteredUser = {
-    id: `user-${Date.now()}`,
-    name: String(name || 'مستخدم جديد').trim(),
+    id: uid,
+    uid,
+    name: String(name || cleanUser).trim(),
     phone: cleanPhone,
     normalizedPhone: norm,
     username: cleanUser,
     normalizedUsername: cleanUser,
-    email: email ? String(email).trim() : undefined,
+    email: cleanEmail || undefined,
     bio: String(bio || 'متاح للدردشة عبر SAHPY-CHAT ✨').trim(),
     avatar:
       avatar ||
       'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=240&auto=format&fit=crop&q=80',
+    emailVerified: Boolean(emailVerified),
+    phoneVerified: Boolean(phoneVerified),
     isOnline: true,
     lastSeen: 'متصل الآن',
     createdAt: new Date().toISOString(),
@@ -285,7 +379,11 @@ app.post('/api/auth/register', (req, res) => {
 
   store.users.unshift(newUser);
   saveStore(store);
-  res.json({ user: newUser, users: store.users, isNew: true });
+  res.json({
+    user: toPublicUser(newUser),
+    users: store.users.map(toPublicUser),
+    isNew: true,
+  });
 });
 
 app.get('/api/stories', (_req, res) => {
@@ -449,8 +547,8 @@ app.get('/api/messages', (req, res) => {
     return (
       s === phone ||
       r === phone ||
-      s.endsWith(phone.slice(-9)) ||
-      r.endsWith(phone.slice(-9))
+      (phone.length >= 9 &&
+        (s.endsWith(phone.slice(-9)) || r.endsWith(phone.slice(-9))))
     );
   });
   res.json({ messages: filtered });

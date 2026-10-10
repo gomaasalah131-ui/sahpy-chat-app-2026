@@ -9,11 +9,14 @@ import { createServer as createViteServer } from 'vite';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const DATA_FILE = path.join(__dirname, 'server-data.json');
+const DATA_FILE = process.env.VERCEL
+  ? path.join('/tmp', 'sahpy-chat-data.json')
+  : path.join(__dirname, 'server-data.json');
 const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
 
 export interface RegisteredUser {
-  id: string;
+  id: string; // Real Firebase Auth UID
+  uid: string;
   name: string;
   phone: string;
   normalizedPhone: string;
@@ -22,6 +25,8 @@ export interface RegisteredUser {
   email?: string;
   bio: string;
   avatar: string;
+  emailVerified: boolean;
+  phoneVerified: boolean;
   isOnline: boolean;
   lastSeen: string;
   createdAt: string;
@@ -29,6 +34,8 @@ export interface RegisteredUser {
 
 export interface ChatMessagePayload {
   id: string;
+  senderUid?: string;
+  recipientUid?: string;
   senderPhone: string;
   senderName: string;
   senderAvatar?: string;
@@ -120,7 +127,10 @@ export function normalizeUsername(str?: string): string {
     .trim()
     .toLowerCase()
     .replace(/^@+/, '')
-    .replace(/\s+/g, '_');
+    .replace(/[^a-z0-9_]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 30);
 }
 
 const DEMO_USER_IDS = new Set([
@@ -129,24 +139,8 @@ const DEMO_USER_IDS = new Set([
   'user-layla',
   'user-omar',
   'user-nour',
+  'user-salah-gomaa',
 ]);
-
-const DEFAULT_USERS: RegisteredUser[] = [
-  {
-    id: 'user-salah-gomaa',
-    name: '𝔼𝕟𝕘𝕚𝕟𝕖𝕖𝕣 𝕊𝔸𝕃𝔸ℍ 𝔾𝕆𝕄𝔸𝔸',
-    phone: '+20 109 876 5432',
-    normalizedPhone: '201098765432',
-    username: 'salah_gomaa',
-    normalizedUsername: 'salah_gomaa',
-    email: 'gomaasalah131@gmail.com',
-    bio: 'Lead Architect & Founder — SAHPY-CHAT ✨',
-    avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=240&auto=format&fit=crop&q=80',
-    isOnline: true,
-    lastSeen: 'متصل الآن',
-    createdAt: new Date().toISOString(),
-  },
-];
 
 function pruneExpiredStories(stories: StoryPayload[]): StoryPayload[] {
   const now = Date.now();
@@ -163,22 +157,16 @@ function loadStore(): ServerStore {
         if (!Array.isArray(parsed.stories)) parsed.stories = [];
         parsed.stories = pruneExpiredStories(parsed.stories);
         parsed.users = parsed.users
-          .filter((u) => !DEMO_USER_IDS.has(u.id))
-          .map((u) => {
-          const fallbackUsername =
-            u.username ||
-            normalizeUsername(u.name) ||
-            `user_${(u.normalizedPhone || '0000').slice(-4)}`;
-          const cleanedName = String(u.name || '').replace(/الديزينر انجينير\s*/g, '').trim() || u.name;
-          const cleanedBio = String(u.bio || '').replace(/الديزينر انجينير\s*/g, '').replace(/نبض شات/g, 'SAHPY-CHAT');
-          return {
+          .filter((u) => !DEMO_USER_IDS.has(u.id) && Boolean(u.uid || u.id))
+          .map((u) => ({
             ...u,
-            name: cleanedName,
-            bio: cleanedBio,
-            username: fallbackUsername,
-            normalizedUsername: normalizeUsername(fallbackUsername),
-          };
-        });
+            uid: u.uid || u.id,
+            id: u.uid || u.id,
+            username: normalizeUsername(u.username),
+            normalizedUsername: normalizeUsername(u.username),
+            emailVerified: Boolean(u.emailVerified),
+            phoneVerified: Boolean(u.phoneVerified),
+          }));
         return parsed;
       }
     }
@@ -186,7 +174,7 @@ function loadStore(): ServerStore {
     console.error('Failed to read server-data.json, initializing fresh store:', err);
   }
   const initial: ServerStore = {
-    users: DEFAULT_USERS,
+    users: [],
     messages: [],
     groups: [],
     stories: [],
@@ -206,6 +194,25 @@ function saveStore(store: ServerStore) {
 
 const store = loadStore();
 
+function toPublicUser(u: RegisteredUser) {
+  return {
+    id: u.uid || u.id,
+    uid: u.uid || u.id,
+    name: u.name,
+    phone: u.phone,
+    normalizedPhone: u.normalizedPhone,
+    username: u.username,
+    normalizedUsername: u.normalizedUsername,
+    bio: u.bio,
+    avatar: u.avatar,
+    emailVerified: u.emailVerified,
+    phoneVerified: u.phoneVerified,
+    isOnline: u.isOnline,
+    lastSeen: u.lastSeen,
+    createdAt: u.createdAt,
+  };
+}
+
 async function startServer() {
   const app = express();
   const httpServer = createServer(app);
@@ -213,7 +220,7 @@ async function startServer() {
   app.use(express.json({ limit: '30mb' }));
 
   const wss = new WebSocketServer({ noServer: true });
-  const clients = new Map<WebSocket, { phone?: string; name?: string }>();
+  const clients = new Map<WebSocket, { phone?: string; name?: string; uid?: string }>();
 
   httpServer.on('upgrade', (request, socket, head) => {
     const url = request.url || '';
@@ -240,7 +247,7 @@ async function startServer() {
     ws.send(
       JSON.stringify({
         type: 'init',
-        users: store.users,
+        users: store.users.map(toPublicUser),
         messages: store.messages.slice(-150),
         groups: store.groups,
         stories: store.stories,
@@ -250,21 +257,20 @@ async function startServer() {
     ws.on('message', (raw) => {
       try {
         const data = JSON.parse(String(raw));
-        if (data.type === 'identify' && data.phone) {
+        if (data.type === 'identify' && (data.phone || data.uid)) {
           const norm = normalizeDigits(data.phone);
-          clients.set(ws, { phone: norm, name: data.name });
+          clients.set(ws, { phone: norm, name: data.name, uid: data.uid });
 
           const user = store.users.find(
             (u) =>
-              u.normalizedPhone === norm ||
-              u.normalizedPhone.endsWith(norm) ||
-              norm.endsWith(u.normalizedPhone)
+              (data.uid && u.uid === data.uid) ||
+              (norm && u.normalizedPhone === norm)
           );
           if (user) {
             user.isOnline = true;
             user.lastSeen = 'متصل الآن';
             saveStore(store);
-            broadcast({ type: 'users:update', users: store.users });
+            broadcast({ type: 'users:update', users: store.users.map(toPublicUser) });
           }
         } else if (data.type === 'chat:message' && data.message) {
           const msg: ChatMessagePayload = data.message;
@@ -282,12 +288,41 @@ async function startServer() {
     });
   });
 
-  // REST API: Get all registered users
-  app.get('/api/users', (_req, res) => {
-    res.json({ users: store.users });
+  // REST API: Check if username is already taken
+  app.get('/api/users/check-username', (req, res) => {
+    const cleanUser = normalizeUsername(String(req.query.username || ''));
+    if (!cleanUser || cleanUser.length < 3) {
+      res.json({ taken: false });
+      return;
+    }
+    const found = store.users.find((u) => u.normalizedUsername === cleanUser);
+    res.json({
+      taken: Boolean(found),
+      uid: found ? found.uid || found.id : undefined,
+    });
   });
 
-  // REST API: Search users by phone number OR username OR name (requires non-empty query like WhatsApp)
+  // REST API: Safely resolve username to email for Firebase Auth login by username
+  app.get('/api/auth/resolve-username', (req, res) => {
+    const cleanUser = normalizeUsername(String(req.query.username || ''));
+    if (!cleanUser) {
+      res.status(400).json({ error: 'يرجى إدخال اسم المستخدم.' });
+      return;
+    }
+    const found = store.users.find((u) => u.normalizedUsername === cleanUser);
+    if (!found || !found.email) {
+      res.status(404).json({ error: 'USERNAME_NOT_FOUND' });
+      return;
+    }
+    res.json({ email: found.email, uid: found.uid || found.id });
+  });
+
+  // REST API: Get registered users (public fields only)
+  app.get('/api/users', (_req, res) => {
+    res.json({ users: store.users.map(toPublicUser) });
+  });
+
+  // REST API: Search real registered users by UID, exact/partial @username, or phone
   app.get('/api/users/search', (req, res) => {
     const q = String(req.query.q || req.query.phone || '').trim();
     if (!q) {
@@ -299,82 +334,126 @@ async function startServer() {
     const qUser = normalizeUsername(q);
 
     const matched = store.users.filter((u) => {
-      const nameMatch = u.name.toLowerCase().includes(qLower);
-      const rawPhoneMatch = u.phone.toLowerCase().includes(qLower);
-      const emailMatch = (u.email || '').toLowerCase().includes(qLower);
+      const uidMatch = (u.uid || u.id).toLowerCase() === qLower;
       const usernameMatch =
-        u.username?.toLowerCase().includes(qLower) ||
-        (qUser.length > 0 && u.normalizedUsername?.includes(qUser));
+        u.username?.toLowerCase() === qLower.replace(/^@+/, '') ||
+        (qUser.length >= 2 && u.normalizedUsername?.includes(qUser));
       const digitMatch =
-        qDigits.length >= 2 &&
+        qDigits.length >= 4 &&
         (u.normalizedPhone.includes(qDigits) || qDigits.includes(u.normalizedPhone));
-      return nameMatch || rawPhoneMatch || emailMatch || usernameMatch || digitMatch;
+      const nameMatch = qLower.length >= 3 && u.name.toLowerCase().includes(qLower);
+      return uidMatch || usernameMatch || digitMatch || nameMatch;
     });
 
-    res.json({ users: matched });
+    res.json({ users: matched.map(toPublicUser) });
   });
 
-  // REST API: Register or login with Gmail, phone number, or username
+  // REST API: Register or sync verified Firebase Auth user profile (Never stores passwords or OTPs)
   app.post('/api/auth/register', (req, res) => {
-    const { name, phone, username, email, bio, avatar } = req.body || {};
+    const {
+      uid,
+      name,
+      phone,
+      username,
+      email,
+      bio,
+      avatar,
+      emailVerified,
+      phoneVerified,
+    } = req.body || {};
+
+    if (!uid || typeof uid !== 'string') {
+      res.status(400).json({
+        error: 'يجب التسجيل عبر Firebase Authentication أولاً للحصول على UID حقيقي.',
+      });
+      return;
+    }
+
     const cleanEmail = String(email || '').trim().toLowerCase();
-    const cleanPhone = String(phone || '+20 109 876 5432').trim();
-    const norm = normalizeDigits(cleanPhone) || '201098765432';
+    const cleanPhone = String(phone || '').trim();
+    const norm = normalizeDigits(cleanPhone);
+    const cleanUser = normalizeUsername(username);
 
-    const cleanUser =
-      normalizeUsername(username) ||
-      (cleanEmail ? normalizeUsername(cleanEmail.split('@')[0]) : '') ||
-      normalizeUsername(name) ||
-      `user_${norm.slice(-4)}`;
+    if (!cleanUser || cleanUser.length < 3) {
+      res.status(400).json({
+        error: 'اسم المستخدم (Username) مطلوب ويجب أن يتكون من 3 أحرف على الأقل.',
+      });
+      return;
+    }
 
-    let existing = store.users.find(
-      (u) =>
-        (cleanEmail && (u.email || '').toLowerCase() === cleanEmail) ||
-        u.normalizedPhone === norm ||
-        (norm.length >= 9 &&
-          (u.normalizedPhone.endsWith(norm.slice(-9)) ||
-            norm.endsWith(u.normalizedPhone.slice(-9)))) ||
-        (cleanUser && u.normalizedUsername === cleanUser)
+    // Enforce unique username across different UIDs
+    const duplicateUsername = store.users.find(
+      (u) => u.normalizedUsername === cleanUser && u.uid !== uid && u.id !== uid
     );
+    if (duplicateUsername) {
+      res.status(409).json({
+        error: 'USERNAME_TAKEN',
+        message: 'اسم المستخدم مستخدم بالفعل من قبل حساب آخر.',
+      });
+      return;
+    }
+
+    // Enforce unique email across different UIDs
+    if (cleanEmail) {
+      const duplicateEmail = store.users.find(
+        (u) =>
+          (u.email || '').toLowerCase() === cleanEmail &&
+          u.uid !== uid &&
+          u.id !== uid
+      );
+      if (duplicateEmail) {
+        res.status(409).json({
+          error: 'EMAIL_ALREADY_REGISTERED',
+          message: 'البريد الإلكتروني مسجل بالفعل لحساب آخر.',
+        });
+        return;
+      }
+    }
+
+    const existing = store.users.find((u) => u.uid === uid || u.id === uid);
 
     if (existing) {
+      existing.uid = uid;
+      existing.id = uid;
       if (name && String(name).trim()) existing.name = String(name).trim();
       if (cleanPhone) {
         existing.phone = cleanPhone;
         existing.normalizedPhone = norm;
       }
-      if (username && String(username).trim()) {
-        existing.username = cleanUser;
-        existing.normalizedUsername = cleanUser;
-      }
-      if (email && String(email).trim()) existing.email = String(email).trim();
+      existing.username = cleanUser;
+      existing.normalizedUsername = cleanUser;
+      if (cleanEmail) existing.email = cleanEmail;
       if (bio && String(bio).trim()) existing.bio = String(bio).trim();
       if (avatar) existing.avatar = avatar;
+      existing.emailVerified = Boolean(emailVerified ?? existing.emailVerified);
+      existing.phoneVerified = Boolean(phoneVerified ?? existing.phoneVerified);
       existing.isOnline = true;
       existing.lastSeen = 'متصل الآن';
       saveStore(store);
-      broadcast({ type: 'users:update', users: store.users });
-      res.json({ user: existing, users: store.users, isNew: false });
+      broadcast({ type: 'users:update', users: store.users.map(toPublicUser) });
+      res.json({
+        user: toPublicUser(existing),
+        users: store.users.map(toPublicUser),
+        isNew: false,
+      });
       return;
     }
 
-    const avatars = [
-      'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=240&auto=format&fit=crop&q=80',
-      'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=240&auto=format&fit=crop&q=80',
-      'https://images.unsplash.com/photo-1517841905240-472988babdf9?w=240&auto=format&fit=crop&q=80',
-      'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=240&auto=format&fit=crop&q=80',
-    ];
-
     const newUser: RegisteredUser = {
-      id: `user-${Date.now()}`,
-      name: String(name || 'مستخدم جديد').trim(),
+      id: uid,
+      uid,
+      name: String(name || cleanUser).trim(),
       phone: cleanPhone,
       normalizedPhone: norm,
       username: cleanUser,
       normalizedUsername: cleanUser,
-      email: email ? String(email).trim() : undefined,
+      email: cleanEmail || undefined,
       bio: String(bio || 'متاح للدردشة عبر SAHPY-CHAT ✨').trim(),
-      avatar: avatar || avatars[store.users.length % avatars.length],
+      avatar:
+        avatar ||
+        'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=240&auto=format&fit=crop&q=80',
+      emailVerified: Boolean(emailVerified),
+      phoneVerified: Boolean(phoneVerified),
       isOnline: true,
       lastSeen: 'متصل الآن',
       createdAt: new Date().toISOString(),
@@ -382,9 +461,13 @@ async function startServer() {
 
     store.users.unshift(newUser);
     saveStore(store);
-    broadcast({ type: 'users:update', users: store.users });
+    broadcast({ type: 'users:update', users: store.users.map(toPublicUser) });
 
-    res.json({ user: newUser, users: store.users, isNew: true });
+    res.json({
+      user: toPublicUser(newUser),
+      users: store.users.map(toPublicUser),
+      isNew: true,
+    });
   });
 
   // REST API: Get active 24h stories
@@ -394,7 +477,7 @@ async function startServer() {
     res.json({ stories: store.stories });
   });
 
-  // REST API: Create a new 24h story (photo or video)
+  // REST API: Create a new 24h story
   app.post('/api/stories', (req, res) => {
     const {
       contactId,
@@ -459,7 +542,8 @@ async function startServer() {
 
   // REST API: Create a new group chat
   app.post('/api/groups', (req, res) => {
-    const { id, name, description, avatar, createdByPhone, customWallpaper, members } = req.body || {};
+    const { id, name, description, avatar, createdByPhone, customWallpaper, members } =
+      req.body || {};
     if (!name || !String(name).trim()) {
       res.status(400).json({ error: 'يرجى إدخال اسم المجموعة.' });
       return;
@@ -507,7 +591,7 @@ async function startServer() {
     res.json({ group });
   });
 
-  // REST API: Send message (supports 1-on-1 and Group Chat)
+  // REST API: Send message
   app.post('/api/messages', (req, res) => {
     const msg: ChatMessagePayload = req.body;
     if (!msg || !msg.senderPhone || (!msg.recipientPhone && !msg.groupId)) {
@@ -520,7 +604,7 @@ async function startServer() {
     res.json({ message: msg });
   });
 
-  // REST API: Get messages for a user phone or group
+  // REST API: Get messages
   app.get('/api/messages', (req, res) => {
     const phone = normalizeDigits(String(req.query.phone || ''));
     const groupId = String(req.query.groupId || '').trim();
@@ -540,8 +624,8 @@ async function startServer() {
       return (
         s === phone ||
         r === phone ||
-        s.endsWith(phone.slice(-9)) ||
-        r.endsWith(phone.slice(-9))
+        (phone.length >= 9 &&
+          (s.endsWith(phone.slice(-9)) || r.endsWith(phone.slice(-9))))
       );
     });
     res.json({ messages: filtered });

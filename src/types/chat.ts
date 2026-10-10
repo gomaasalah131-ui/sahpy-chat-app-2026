@@ -36,6 +36,7 @@ export interface MessageReaction {
 export interface Message {
   id: string;
   senderId: 'me' | string;
+  senderUid?: string;
   senderName?: string;
   senderPhone?: string;
   senderAvatar?: string;
@@ -82,6 +83,8 @@ export interface GroupMember {
 
 export interface Contact {
   id: string;
+  uid?: string;
+  chatId?: string;
   name: string;
   phone: string;
   username?: string;
