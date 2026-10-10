@@ -349,6 +349,13 @@ export function translateFirebaseAuthError(error: unknown): string {
   if (code.includes('auth/internal-error')) {
     return `خطأ داخلي من Firebase [auth/internal-error]: (${rawMsg}). غالباً ما يحدث بسبب عدم تفعيل مزود Phone في Firebase Console أو عدم تفويض النطاق (${currentHost}) في Authorized domains.`;
   }
+  if (
+    code.includes('token-service-api-has-not-been-used') ||
+    rawMsg.includes('token-service-api-has-not-been-used') ||
+    rawMsg.includes('securetoken.googleapis.com')
+  ) {
+    return `تنبيه إعدادات Google Cloud [auth/token-service-api-has-not-been-used]: خدمة Token Service API (securetoken.googleapis.com) غير مفعّلة في مشروع Google AI Studio Starter Tier رقم (892622995916) لأن حساب Starter Tier لا يملك صلاحية IAM (serviceusage.services.enable) لتفعيل واجهات Google Cloud الإضافية. تم تفعيل المعالجة البديلة في الكود لإصدار الرموز مباشرة عبر Identity Toolkit API دون الحاجة لـ Secure Token API.`;
+  }
   if (code.includes('auth/requires-recent-login')) {
     return 'لأسباب أمنية [auth/requires-recent-login]، يرجى تسجيل الخروج ثم تسجيل الدخول مجدداً لإتمام هذه العملية الحساسة.';
   }
@@ -366,13 +373,16 @@ export interface FirebasePhoneAuthDiagnostics {
   isCurrentDomainAuthorized: boolean;
   recaptchaEnterpriseConfigured: boolean;
   recaptchaV2SiteKeyPresent: boolean;
+  identityToolkitApiEnabled: boolean;
+  secureTokenApiEnabled: boolean;
+  secureTokenApiStatusDetail: string;
   phoneAuthProbeStatus: 'unknown' | 'operation_not_allowed' | 'ready_or_requires_token' | 'error';
   phoneAuthProbeDetail: string;
 }
 
 /**
- * Inspects live Firebase Identity Toolkit configuration & Authorized Domains
- * for the current project without disabling reCAPTCHA or exposing secrets.
+ * Inspects live Firebase Identity Toolkit configuration, Secure Token API status,
+ * & Authorized Domains for the current project without disabling reCAPTCHA or exposing secrets.
  */
 export async function inspectFirebasePhoneAuthEnvironment(): Promise<FirebasePhoneAuthDiagnostics> {
   const currentHostname =
@@ -383,6 +393,9 @@ export async function inspectFirebasePhoneAuthEnvironment(): Promise<FirebasePho
   let authorizedDomains: string[] = [];
   let recaptchaEnterpriseConfigured = false;
   let recaptchaV2SiteKeyPresent = false;
+  let identityToolkitApiEnabled = false;
+  let secureTokenApiEnabled = true;
+  let secureTokenApiStatusDetail = '';
   let phoneAuthProbeStatus: FirebasePhoneAuthDiagnostics['phoneAuthProbeStatus'] =
     'unknown';
   let phoneAuthProbeDetail = '';
@@ -392,9 +405,35 @@ export async function inspectFirebasePhoneAuthEnvironment(): Promise<FirebasePho
       `https://identitytoolkit.googleapis.com/v1/projects?key=${encodeURIComponent(apiKey)}`
     );
     if (projRes.ok) {
+      identityToolkitApiEnabled = true;
       const projData = await projRes.json();
       if (Array.isArray(projData.authorizedDomains)) {
         authorizedDomains = projData.authorizedDomains;
+      }
+    }
+  } catch {
+    // ignore network error during diagnostics
+  }
+
+  try {
+    const stRes = await fetch(
+      `https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(apiKey)}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: 'grant_type=refresh_token&refresh_token=probe_check',
+      }
+    );
+    if (stRes.status === 403) {
+      const stErr = await stRes.json().catch(() => ({}));
+      const msg = String(stErr?.error?.message || '');
+      if (
+        msg.includes('Token Service API has not been used') ||
+        msg.includes('securetoken.googleapis.com')
+      ) {
+        secureTokenApiEnabled = false;
+        secureTokenApiStatusDetail =
+          'Secure Token API (securetoken.googleapis.com) معطّلة في مشروع AI Studio Starter Tier (892622995916) بسبب قيود صلاحيات Google Cloud IAM (Missing required permission: serviceusage.services.enable). يعمل التطبيق الآن عبر Identity Toolkit API مباشرة دون استدعاء Secure Token API.';
       }
     }
   } catch {
@@ -451,6 +490,9 @@ export async function inspectFirebasePhoneAuthEnvironment(): Promise<FirebasePho
     isCurrentDomainAuthorized,
     recaptchaEnterpriseConfigured,
     recaptchaV2SiteKeyPresent,
+    identityToolkitApiEnabled,
+    secureTokenApiEnabled,
+    secureTokenApiStatusDetail,
     phoneAuthProbeStatus,
     phoneAuthProbeDetail,
   };
@@ -459,6 +501,22 @@ export async function inspectFirebasePhoneAuthEnvironment(): Promise<FirebasePho
 // ============================================================================
 // 1. REAL FIREBASE AUTHENTICATION OPERATIONS
 // ============================================================================
+
+// Ephemeral in-memory credentials for the current browser tab session only (never persisted)
+// Used strictly as a fallback when Secure Token API (securetoken.googleapis.com) is disabled
+// in Starter Tier projects so Identity Toolkit API can mint a fresh idToken after email verification.
+let ephemeralSessionAuth: { email: string; password: string } | null = null;
+
+function isTokenServiceDisabledError(err: unknown): boolean {
+  const code = String((err as { code?: string })?.code || '');
+  const msg = err instanceof Error ? err.message : String(err || '');
+  return (
+    code.includes('token-service-api-has-not-been-used') ||
+    msg.includes('token-service-api-has-not-been-used') ||
+    msg.includes('securetoken.googleapis.com') ||
+    code.includes('auth/user-token-expired')
+  );
+}
 
 export async function signInWithGoogleCloud(): Promise<User> {
   const cred = await signInWithPopup(auth, googleProvider);
@@ -476,6 +534,7 @@ export async function registerWithEmailAndPasswordCloud(params: {
     cleanEmail,
     params.password
   );
+  ephemeralSessionAuth = { email: cleanEmail, password: params.password };
   if (params.displayName.trim()) {
     await updateProfile(cred.user, {
       displayName: params.displayName.trim().slice(0, 80),
@@ -491,6 +550,7 @@ export async function loginWithEmailAndPasswordCloud(
 ): Promise<User> {
   const cleanEmail = email.trim().toLowerCase();
   const cred = await signInWithEmailAndPassword(auth, cleanEmail, password);
+  ephemeralSessionAuth = { email: cleanEmail, password };
   return cred.user;
 }
 
@@ -509,10 +569,71 @@ export async function sendPasswordResetEmailCloud(email: string): Promise<void> 
   await sendPasswordResetEmail(auth, cleanEmail);
 }
 
+/**
+ * Safely reloads the current user via Identity Toolkit (accounts:lookup) without
+ * crashing when Secure Token API (securetoken.googleapis.com) is disabled in
+ * Google AI Studio Starter Tier projects.
+ */
 export async function reloadAndCheckCurrentUser(): Promise<User | null> {
   if (!auth.currentUser) return null;
-  await auth.currentUser.reload();
-  await auth.currentUser.getIdToken(true);
+
+  try {
+    await auth.currentUser.reload();
+  } catch (reloadErr) {
+    if (isTokenServiceDisabledError(reloadErr) && ephemeralSessionAuth) {
+      try {
+        const reauthed = await signInWithEmailAndPassword(
+          auth,
+          ephemeralSessionAuth.email,
+          ephemeralSessionAuth.password
+        );
+        return reauthed.user;
+      } catch {
+        return auth.currentUser;
+      }
+    }
+    if (!isTokenServiceDisabledError(reloadErr)) {
+      throw reloadErr;
+    }
+  }
+
+  // If the user just verified their email, attempt to refresh claims safely:
+  // Avoid crashing if securetoken.googleapis.com is disabled on Starter Tier.
+  if (auth.currentUser) {
+    try {
+      await auth.currentUser.getIdToken(false);
+    } catch (tokenErr) {
+      if (isTokenServiceDisabledError(tokenErr) && ephemeralSessionAuth) {
+        try {
+          const reauthed = await signInWithEmailAndPassword(
+            auth,
+            ephemeralSessionAuth.email,
+            ephemeralSessionAuth.password
+          );
+          return reauthed.user;
+        } catch {
+          // ignore fallback error
+        }
+      }
+    }
+
+    // If emailVerified became true on the server, re-mint idToken via Identity Toolkit
+    // if ephemeralSessionAuth is available so Firestore rules see email_verified == true
+    // without calling securetoken.googleapis.com.
+    if (auth.currentUser.emailVerified && ephemeralSessionAuth) {
+      try {
+        const reauthed = await signInWithEmailAndPassword(
+          auth,
+          ephemeralSessionAuth.email,
+          ephemeralSessionAuth.password
+        );
+        return reauthed.user;
+      } catch {
+        // ignore and return current user
+      }
+    }
+  }
+
   return auth.currentUser;
 }
 
@@ -686,8 +807,13 @@ export async function sendPhoneOtpViaFirebase(
         );
       } catch (linkErr) {
         const errCode = (linkErr as { code?: string })?.code || '';
-        // If current user already has a phone provider linked, fall back to signInWithPhoneNumber
-        if (errCode.includes('auth/provider-already-linked')) {
+        // If current user already has a phone provider linked OR if linkWithPhoneNumber
+        // tried to call the disabled Secure Token API (securetoken.googleapis.com) on an
+        // expired session token, fall back to signInWithPhoneNumber which uses Identity Toolkit directly!
+        if (
+          errCode.includes('auth/provider-already-linked') ||
+          isTokenServiceDisabledError(linkErr)
+        ) {
           const freshVerifier = await ensureRecaptchaVerifier(
             recaptchaContainerId,
             size
@@ -734,15 +860,25 @@ export async function confirmPhoneOtpViaFirebase(
     throw { code: 'auth/invalid-verification-code' };
   }
   const result = await confirmationResult.confirm(cleanCode);
+  // IMPORTANT: Do NOT call getIdToken(true) here because confirmationResult.confirm()
+  // already returns a brand-new idToken from identitytoolkit.googleapis.com, whereas
+  // getIdToken(true) forces a call to securetoken.googleapis.com which is disabled in
+  // Google AI Studio Starter Tier projects (892622995916).
   if (auth.currentUser) {
-    await auth.currentUser.reload();
-    await auth.currentUser.getIdToken(true);
+    try {
+      await auth.currentUser.reload();
+    } catch (reloadErr) {
+      if (!isTokenServiceDisabledError(reloadErr)) {
+        throw reloadErr;
+      }
+    }
   }
   clearRecaptchaVerifier();
   return result.user;
 }
 
 export async function signOutFromCloud(): Promise<void> {
+  ephemeralSessionAuth = null;
   clearRecaptchaVerifier();
   await signOut(auth);
 }

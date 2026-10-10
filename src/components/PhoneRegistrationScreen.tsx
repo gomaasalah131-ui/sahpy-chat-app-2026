@@ -600,8 +600,11 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
         targetEmail,
         loginPassword
       );
-      await loggedInUser.reload();
-      await loggedInUser.getIdToken(true);
+      try {
+        await loggedInUser.reload();
+      } catch {
+        // Ignore reload error if Secure Token API is disabled; signInWithEmailAndPassword already returned fresh user state
+      }
 
       if (!loggedInUser.emailVerified) {
         setIsEmailVerified(false);
@@ -2039,20 +2042,51 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                     >
                       <div className="flex items-center justify-between flex-wrap gap-1 font-bold text-cyan-300">
                         <span>فحص إعدادات Firebase Phone Auth & Authorized Domains:</span>
-                        <span
-                          dir="ltr"
-                          className={`px-2 py-0.5 rounded text-[10px] font-mono ${
-                            phoneDiagnostics.isCurrentDomainAuthorized
-                              ? 'bg-emerald-500/20 text-emerald-300'
-                              : 'bg-rose-500/20 text-rose-300'
-                          }`}
-                        >
-                          {phoneDiagnostics.currentHostname}:{' '}
-                          {phoneDiagnostics.isCurrentDomainAuthorized
-                            ? 'Authorized ✓'
-                            : 'NOT in Authorized Domains ✗'}
-                        </span>
+                        <div className="flex items-center flex-wrap gap-1.5" dir="ltr">
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-mono ${
+                              phoneDiagnostics.identityToolkitApiEnabled
+                                ? 'bg-emerald-500/20 text-emerald-300'
+                                : 'bg-rose-500/20 text-rose-300'
+                            }`}
+                          >
+                            Identity Toolkit API:{' '}
+                            {phoneDiagnostics.identityToolkitApiEnabled
+                              ? 'Enabled ✓'
+                              : 'Disabled ✗'}
+                          </span>
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-mono ${
+                              phoneDiagnostics.secureTokenApiEnabled
+                                ? 'bg-emerald-500/20 text-emerald-300'
+                                : 'bg-amber-500/20 text-amber-300'
+                            }`}
+                          >
+                            Secure Token API:{' '}
+                            {phoneDiagnostics.secureTokenApiEnabled
+                              ? 'Enabled ✓'
+                              : 'Starter Tier Bypass Active ⚡'}
+                          </span>
+                          <span
+                            className={`px-2 py-0.5 rounded text-[10px] font-mono ${
+                              phoneDiagnostics.isCurrentDomainAuthorized
+                                ? 'bg-emerald-500/20 text-emerald-300'
+                                : 'bg-rose-500/20 text-rose-300'
+                            }`}
+                          >
+                            {phoneDiagnostics.currentHostname}:{' '}
+                            {phoneDiagnostics.isCurrentDomainAuthorized
+                              ? 'Authorized ✓'
+                              : 'NOT in Authorized Domains ✗'}
+                          </span>
+                        </div>
                       </div>
+                      {!phoneDiagnostics.secureTokenApiEnabled && (
+                        <p className="text-amber-300/95">
+                          • <strong>بخصوص خطأ Secure Token API (المشروع 892622995916):</strong>{' '}
+                          {phoneDiagnostics.secureTokenApiStatusDetail}
+                        </p>
+                      )}
                       <p className="text-white/65">
                         • <strong>بخصوص رسالة reCAPTCHA Enterprise:</strong> ظهور الرسالة{' '}
                         <code dir="ltr" className="text-amber-300 font-mono">
