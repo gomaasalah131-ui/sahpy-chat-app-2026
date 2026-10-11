@@ -1,6 +1,8 @@
 import { initializeApp } from 'firebase/app';
 import {
   getAuth,
+  setPersistence,
+  browserLocalPersistence,
   GoogleAuthProvider,
   signInWithPopup,
   signOut,
@@ -17,6 +19,7 @@ import {
   getFirestore,
   doc,
   getDoc,
+  getDocs,
   getDocFromServer,
   setDoc,
   updateDoc,
@@ -35,6 +38,57 @@ const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
+
+// Configure official Firebase Authentication local session persistence across refreshes & browser restarts
+if (typeof window !== 'undefined') {
+  setPersistence(auth, browserLocalPersistence).catch(() => {
+    // Fallback silently if storage is restricted in iframe environment
+  });
+}
+
+const LEGACY_SHARED_DEFAULT_AVATAR =
+  'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=240&auto=format&fit=crop&q=80';
+
+/**
+ * Generates a unique, account-specific SVG avatar data URI bound to a user's UID or name
+ * so different users never share a hardcoded stock photo of another person.
+ */
+export function buildAccountBoundSvgAvatar(seed: string, label?: string): string {
+  const cleanSeed = String(seed || 'user').trim() || 'user';
+  let hash = 0;
+  for (let i = 0; i < cleanSeed.length; i++) {
+    hash = (hash * 31 + cleanSeed.charCodeAt(i)) >>> 0;
+  }
+  const palettes = [
+    ['#059669', '#0d9488'],
+    ['#4f46e5', '#7c3aed'],
+    ['#0284c7', '#2563eb'],
+    ['#db2777', '#e11d48'],
+    ['#d97706', '#ea580c'],
+    ['#7c3aed', '#c026d3'],
+  ];
+  const [c1, c2] = palettes[hash % palettes.length];
+  const rawInitial = String(label || cleanSeed)
+    .replace(/^@+/, '')
+    .trim()
+    .charAt(0)
+    .toUpperCase() || 'S';
+  const safeInitial = rawInitial.replace(/[<>&"']/g, '');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120"><defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="${c1}"/><stop offset="100%" stop-color="${c2}"/></linearGradient></defs><rect width="120" height="120" rx="60" fill="url(#g)"/><text x="50%" y="54%" dominant-baseline="middle" text-anchor="middle" fill="#ffffff" font-family="system-ui, sans-serif" font-weight="700" font-size="52">${safeInitial}</text></svg>`;
+  return `data:image/svg+xml;utf8,${encodeURIComponent(svg)}`;
+}
+
+export function normalizeUserAvatarUrl(
+  rawAvatar?: string | null,
+  seedUidOrId?: string,
+  displayName?: string
+): string {
+  const trimmed = String(rawAvatar || '').trim();
+  if (!trimmed || trimmed === LEGACY_SHARED_DEFAULT_AVATAR) {
+    return buildAccountBoundSvgAvatar(seedUidOrId || displayName || 'sahpy', displayName);
+  }
+  return trimmed;
+}
 
 export { onAuthStateChanged };
 export type { User };
@@ -1088,6 +1142,7 @@ export interface FirestoreUserProfileData {
   wallpaperTheme: WallpaperThemeId;
   emailVerified: boolean;
   phoneVerified: boolean;
+  avatarUrl?: string;
 }
 
 export interface PublicDirectoryUser {
@@ -1098,6 +1153,7 @@ export interface PublicDirectoryUser {
   avatarFallbackColor: string;
   emailVerified: boolean;
   phoneVerified: boolean;
+  avatarUrl?: string;
 }
 
 export async function checkUsernameAvailability(
@@ -1162,6 +1218,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
   wallpaperTheme: WallpaperThemeId;
   phoneVerified: boolean;
   avatarFallbackColor?: string;
+  avatarUrl?: string;
 }): Promise<FirestoreUserProfileData> {
   const hasVerifiedToken = await ensureValidAuthTokenForFirestore({
     requireVerifiedClaim: true,
@@ -1197,6 +1254,11 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
     0,
     40
   );
+  const rawIncomingAvatar = String(
+    params.avatarUrl || auth.currentUser.photoURL || ''
+  )
+    .trim()
+    .slice(0, 240000);
   const emailVerified = Boolean(auth.currentUser.emailVerified || params.user.emailVerified);
   // Phone number is a regular profile field for search only (never marked verified via SMS)
   const phoneVerified = false;
@@ -1204,6 +1266,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
   const userRef = doc(db, 'users', uid);
   const dirRef = doc(db, 'directory', uid);
   let previousPhoneTag = '';
+  let existingAvatarUrl = '';
 
   // If a legacy user document exists from an older schema (missing uid/createdAt/wallpaperTheme),
   // clean it up first so the transaction creates a strictly compliant UserProfile document.
@@ -1212,6 +1275,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
     if (existingUserSnap.exists()) {
       const uData = existingUserSnap.data();
       previousPhoneTag = String(uData.phoneTag || uData.phone || '').trim();
+      existingAvatarUrl = String(uData.avatarUrl || uData.avatar || '').trim();
       const hasLegacyShape =
         !uData.uid ||
         !uData.username ||
@@ -1228,6 +1292,9 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
     const existingDirSnap = await getDoc(dirRef);
     if (existingDirSnap.exists()) {
       const dData = existingDirSnap.data();
+      if (!existingAvatarUrl && dData.avatarUrl) {
+        existingAvatarUrl = String(dData.avatarUrl).trim();
+      }
       const hasLegacyDirShape =
         !dData.uid ||
         !dData.username ||
@@ -1240,6 +1307,12 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
   } catch {
     // ignore pre-migration check error
   }
+
+  const resolvedAvatarUrl = normalizeUserAvatarUrl(
+    rawIncomingAvatar || existingAvatarUrl,
+    uid,
+    safeDisplayName
+  ).slice(0, 240000);
 
   let resolvedUsername = cleanUsername;
 
@@ -1272,6 +1345,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
           displayName: safeDisplayName,
           bio: safeBio,
           avatarFallbackColor: safeColor,
+          avatarUrl: resolvedAvatarUrl,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
@@ -1280,6 +1354,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
           displayName: safeDisplayName,
           bio: safeBio,
           avatarFallbackColor: safeColor,
+          avatarUrl: resolvedAvatarUrl,
           updatedAt: serverTimestamp(),
         });
       }
@@ -1291,6 +1366,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
           displayName: safeDisplayName,
           bio: safeBio,
           avatarFallbackColor: safeColor,
+          avatarUrl: resolvedAvatarUrl,
           emailVerified,
           phoneVerified,
           createdAt: serverTimestamp(),
@@ -1301,6 +1377,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
           displayName: safeDisplayName,
           bio: safeBio,
           avatarFallbackColor: safeColor,
+          avatarUrl: resolvedAvatarUrl,
           emailVerified,
           phoneVerified,
           updatedAt: serverTimestamp(),
@@ -1318,6 +1395,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
           wallpaperTheme: params.wallpaperTheme,
           emailVerified,
           phoneVerified,
+          avatarUrl: resolvedAvatarUrl,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
@@ -1329,6 +1407,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
           wallpaperTheme: params.wallpaperTheme,
           emailVerified,
           phoneVerified,
+          avatarUrl: resolvedAvatarUrl,
           updatedAt: serverTimestamp(),
         });
       }
@@ -1366,6 +1445,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
           displayName: safeDisplayName,
           bio: safeBio,
           avatarFallbackColor: safeColor,
+          avatarUrl: resolvedAvatarUrl,
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
@@ -1375,12 +1455,50 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
           displayName: safeDisplayName,
           bio: safeBio,
           avatarFallbackColor: safeColor,
+          avatarUrl: resolvedAvatarUrl,
           updatedAt: serverTimestamp(),
         });
       }
     }
   } catch {
     // Non-fatal if another user already indexed the same unverified phone number
+  }
+
+  // Also propagate updated displayName and avatarUrl to active /chats/{chatId} rooms where this user is a participant
+  try {
+    const q1 = query(
+      collection(db, 'chats'),
+      where('participantOneUid', '==', uid)
+    );
+    const q2 = query(
+      collection(db, 'chats'),
+      where('participantTwoUid', '==', uid)
+    );
+    const [s1, s2] = await Promise.all([getDocs(q1), getDocs(q2)]);
+    for (const d of s1.docs) {
+      const cData = d.data();
+      await updateDoc(d.ref, {
+        participantOneName: safeDisplayName,
+        participantOneAvatar: resolvedAvatarUrl,
+        lastMessageSenderUid: uid,
+        lastMessageText: String(cData.lastMessageText || 'بدأت محادثة آمنة وموثقة 👋'),
+        lastMessageTime: String(cData.lastMessageTime || 'الآن'),
+        updatedAt: serverTimestamp(),
+      }).catch(() => {});
+    }
+    for (const d of s2.docs) {
+      const cData = d.data();
+      await updateDoc(d.ref, {
+        participantTwoName: safeDisplayName,
+        participantTwoAvatar: resolvedAvatarUrl,
+        lastMessageSenderUid: uid,
+        lastMessageText: String(cData.lastMessageText || 'بدأت محادثة آمنة وموثقة 👋'),
+        lastMessageTime: String(cData.lastMessageTime || 'الآن'),
+        updatedAt: serverTimestamp(),
+      }).catch(() => {});
+    }
+  } catch {
+    // non-fatal chat room profile sync
   }
 
   cacheUsernameEmailMapping(resolvedUsername, safeEmail);
@@ -1395,6 +1513,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
     wallpaperTheme: params.wallpaperTheme,
     emailVerified,
     phoneVerified: false,
+    avatarUrl: resolvedAvatarUrl,
   };
 }
 
@@ -1411,9 +1530,10 @@ export async function getOwnUserProfileFromFirestore(
     const snap = await getDoc(doc(db, 'users', uid));
     if (!snap.exists()) return null;
     const d = snap.data();
+    const displayName = String(d.displayName || d.name || '');
     return {
       uid: String(d.uid || uid),
-      displayName: String(d.displayName || d.name || ''),
+      displayName,
       username: String(d.username || ''),
       email: String(d.email || auth.currentUser?.email || ''),
       phoneTag: formatDisplayPhone(String(d.phoneTag || d.phone || '')),
@@ -1421,6 +1541,11 @@ export async function getOwnUserProfileFromFirestore(
       wallpaperTheme: (d.wallpaperTheme as WallpaperThemeId) || 'aurora-borealis',
       emailVerified: Boolean(d.emailVerified ?? auth.currentUser?.emailVerified),
       phoneVerified: false,
+      avatarUrl: normalizeUserAvatarUrl(
+        String(d.avatarUrl || d.avatar || auth.currentUser?.photoURL || ''),
+        uid,
+        displayName
+      ),
     };
   } catch (error) {
     // If token expired right before getDoc in Starter Tier, attempt re-auth once before surfacing error
@@ -1431,9 +1556,10 @@ export async function getOwnUserProfileFromFirestore(
         const retrySnap = await getDoc(doc(db, 'users', uid));
         if (!retrySnap.exists()) return null;
         const d = retrySnap.data();
+        const displayName = String(d.displayName || d.name || '');
         return {
           uid: String(d.uid || uid),
-          displayName: String(d.displayName || d.name || ''),
+          displayName,
           username: String(d.username || ''),
           email: String(d.email || auth.currentUser?.email || ''),
           phoneTag: formatDisplayPhone(String(d.phoneTag || d.phone || '')),
@@ -1444,12 +1570,47 @@ export async function getOwnUserProfileFromFirestore(
             d.emailVerified ?? auth.currentUser?.emailVerified
           ),
           phoneVerified: false,
+          avatarUrl: normalizeUserAvatarUrl(
+            String(d.avatarUrl || d.avatar || auth.currentUser?.photoURL || ''),
+            uid,
+            displayName
+          ),
         };
       } catch {
         // Fall through
       }
     }
     handleFirestoreError(error, OperationType.GET, path);
+  }
+}
+
+export async function getPublicDirectoryProfileByUid(
+  targetUid: string
+): Promise<PublicDirectoryUser | null> {
+  if (!auth.currentUser || !targetUid) return null;
+  const safeUid = sanitizeDocId(targetUid);
+  if (!safeUid) return null;
+  try {
+    const snap = await getDoc(doc(db, 'directory', safeUid));
+    if (!snap.exists()) return null;
+    const d = snap.data();
+    const displayName = String(d.displayName || d.username || '');
+    return {
+      uid: String(d.uid || safeUid),
+      username: String(d.username || ''),
+      displayName,
+      bio: String(d.bio || ''),
+      avatarFallbackColor: String(d.avatarFallbackColor || 'bg-emerald-600'),
+      emailVerified: Boolean(d.emailVerified),
+      phoneVerified: false,
+      avatarUrl: normalizeUserAvatarUrl(
+        String(d.avatarUrl || ''),
+        String(d.uid || safeUid),
+        displayName
+      ),
+    };
+  } catch {
+    return null;
   }
 }
 
@@ -1512,36 +1673,48 @@ export async function findRegisteredUserInFirestore(
     try {
       const unameSnap = await getDoc(doc(db, 'usernames', candidateUsername));
       if (unameSnap.exists()) {
-        const targetUid = String(unameSnap.data().uid || '');
+        const uData = unameSnap.data();
+        const targetUid = String(uData.uid || '');
         if (targetUid) {
           const dirSnap = await getDoc(doc(db, 'directory', targetUid));
           if (dirSnap.exists()) {
             const d = dirSnap.data();
+            const displayName = String(d.displayName || candidateUsername);
             const found: PublicDirectoryUser = {
               uid: String(d.uid || targetUid),
               username: String(d.username || candidateUsername),
-              displayName: String(d.displayName || candidateUsername),
+              displayName,
               bio: String(d.bio || ''),
               avatarFallbackColor: String(
                 d.avatarFallbackColor || 'bg-emerald-600'
               ),
               emailVerified: Boolean(d.emailVerified),
               phoneVerified: false,
+              avatarUrl: normalizeUserAvatarUrl(
+                String(d.avatarUrl || uData.avatarUrl || ''),
+                String(d.uid || targetUid),
+                displayName
+              ),
             };
             lastSearchQueryCache = { query: cacheKey, result: found, ts: Date.now() };
             return found;
           }
-          const uData = unameSnap.data();
+          const displayName = String(uData.displayName || candidateUsername);
           const found: PublicDirectoryUser = {
             uid: targetUid,
             username: String(uData.username || candidateUsername),
-            displayName: String(uData.displayName || candidateUsername),
+            displayName,
             bio: String(uData.bio || ''),
             avatarFallbackColor: String(
               uData.avatarFallbackColor || 'bg-emerald-600'
             ),
             emailVerified: true,
             phoneVerified: false,
+            avatarUrl: normalizeUserAvatarUrl(
+              String(uData.avatarUrl || ''),
+              targetUid,
+              displayName
+            ),
           };
           lastSearchQueryCache = { query: cacheKey, result: found, ts: Date.now() };
           return found;
@@ -1568,30 +1741,42 @@ export async function findRegisteredUserInFirestore(
           const dirSnap = await getDoc(doc(db, 'directory', targetUid));
           if (dirSnap.exists()) {
             const d = dirSnap.data();
+            const displayName = String(d.displayName || pData.displayName || '');
             const found: PublicDirectoryUser = {
               uid: String(d.uid || targetUid),
               username: String(d.username || pData.username || ''),
-              displayName: String(d.displayName || pData.displayName || ''),
+              displayName,
               bio: String(d.bio || pData.bio || ''),
               avatarFallbackColor: String(
                 d.avatarFallbackColor || pData.avatarFallbackColor || 'bg-emerald-600'
               ),
               emailVerified: Boolean(d.emailVerified),
               phoneVerified: false,
+              avatarUrl: normalizeUserAvatarUrl(
+                String(d.avatarUrl || pData.avatarUrl || ''),
+                String(d.uid || targetUid),
+                displayName
+              ),
             };
             lastSearchQueryCache = { query: cacheKey, result: found, ts: Date.now() };
             return found;
           }
+          const displayName = String(pData.displayName || '');
           const found: PublicDirectoryUser = {
             uid: targetUid,
             username: String(pData.username || ''),
-            displayName: String(pData.displayName || ''),
+            displayName,
             bio: String(pData.bio || ''),
             avatarFallbackColor: String(
               pData.avatarFallbackColor || 'bg-emerald-600'
             ),
             emailVerified: true,
             phoneVerified: false,
+            avatarUrl: normalizeUserAvatarUrl(
+              String(pData.avatarUrl || ''),
+              targetUid,
+              displayName
+            ),
           };
           lastSearchQueryCache = { query: cacheKey, result: found, ts: Date.now() };
           return found;
@@ -1613,16 +1798,22 @@ export async function findRegisteredUserInFirestore(
       const dirSnap = await getDoc(doc(db, 'directory', candidateUid));
       if (dirSnap.exists()) {
         const d = dirSnap.data();
+        const displayName = String(d.displayName || '');
         const found: PublicDirectoryUser = {
           uid: String(d.uid || candidateUid),
           username: String(d.username || ''),
-          displayName: String(d.displayName || ''),
+          displayName,
           bio: String(d.bio || ''),
           avatarFallbackColor: String(
             d.avatarFallbackColor || 'bg-emerald-600'
           ),
           emailVerified: Boolean(d.emailVerified),
           phoneVerified: false,
+          avatarUrl: normalizeUserAvatarUrl(
+            String(d.avatarUrl || ''),
+            String(d.uid || candidateUid),
+            displayName
+          ),
         };
         lastSearchQueryCache = { query: cacheKey, result: found, ts: Date.now() };
         return found;
@@ -1640,14 +1831,21 @@ export async function findRegisteredUserInFirestore(
     if (res.ok) {
       const data = await res.json();
       if (data?.user?.uid) {
+        const uidVal = String(data.user.uid);
+        const displayName = String(data.user.name || data.user.displayName || '');
         const found: PublicDirectoryUser = {
-          uid: String(data.user.uid),
+          uid: uidVal,
           username: String(data.user.username || ''),
-          displayName: String(data.user.name || data.user.displayName || ''),
+          displayName,
           bio: String(data.user.bio || ''),
           avatarFallbackColor: 'bg-emerald-600',
           emailVerified: Boolean(data.user.emailVerified ?? true),
           phoneVerified: false,
+          avatarUrl: normalizeUserAvatarUrl(
+            String(data.user.avatar || data.user.avatarUrl || ''),
+            uidVal,
+            displayName
+          ),
         };
         lastSearchQueryCache = { query: cacheKey, result: found, ts: Date.now() };
         return found;
@@ -1675,9 +1873,11 @@ export async function createOrGetAuthorizedChatRoom(params: {
   myUid: string;
   myName: string;
   myUsername: string;
+  myAvatar?: string;
   otherUid: string;
   otherName: string;
   otherUsername: string;
+  otherAvatar?: string;
 }): Promise<string> {
   if (!auth.currentUser || auth.currentUser.uid !== params.myUid) {
     throw new Error('يجب تسجيل الدخول والتحقق من الهوية لإنشاء محادثة.');
@@ -1712,12 +1912,12 @@ export async function createOrGetAuthorizedChatRoom(params: {
   const participantTwoName = (
     isMeFirst ? params.otherName : params.myName
   ).slice(0, 80);
-  const participantOneUsername = sanitizeUsername(
-    isMeFirst ? params.myUsername : params.otherUsername
-  );
-  const participantTwoUsername = sanitizeUsername(
-    isMeFirst ? params.otherUsername : params.myUsername
-  );
+  const participantOneUsername =
+    sanitizeUsername(isMeFirst ? params.myUsername : params.otherUsername) ||
+    `user_${sanitizeDocId(participantOneUid).slice(0, 8).toLowerCase()}`;
+  const participantTwoUsername =
+    sanitizeUsername(isMeFirst ? params.otherUsername : params.myUsername) ||
+    `user_${sanitizeDocId(participantTwoUid).slice(0, 8).toLowerCase()}`;
 
   try {
     // Verify target user exists in /directory/{otherUid}
@@ -1727,6 +1927,24 @@ export async function createOrGetAuthorizedChatRoom(params: {
         'هذا المستخدم غير موجود في قاعدة بيانات Firestore المعتمدة.'
       );
     }
+    const targetDirData = targetDirSnap.data();
+    const resolvedOtherAvatar = normalizeUserAvatarUrl(
+      String(params.otherAvatar || targetDirData.avatarUrl || ''),
+      params.otherUid,
+      params.otherName
+    ).slice(0, 240000);
+    const resolvedMyAvatar = normalizeUserAvatarUrl(
+      String(params.myAvatar || auth.currentUser?.photoURL || ''),
+      params.myUid,
+      params.myName
+    ).slice(0, 240000);
+
+    const participantOneAvatar = isMeFirst
+      ? resolvedMyAvatar
+      : resolvedOtherAvatar;
+    const participantTwoAvatar = isMeFirst
+      ? resolvedOtherAvatar
+      : resolvedMyAvatar;
 
     const existingChat = await getDoc(chatRef);
     if (!existingChat.exists()) {
@@ -1738,8 +1956,10 @@ export async function createOrGetAuthorizedChatRoom(params: {
         participantTwoName,
         participantOneUsername,
         participantTwoUsername,
+        participantOneAvatar,
+        participantTwoAvatar,
         createdByUid: params.myUid,
-        lastMessageText: 'بدأت محادثة آمنة وموثقة 👋',
+        lastMessageText: '',
         lastMessageSenderUid: params.myUid,
         lastMessageTime: 'الآن',
         createdAt: serverTimestamp(),
@@ -1758,6 +1978,16 @@ export async function createOrGetAuthorizedChatRoom(params: {
   }
 }
 
+const inFlightAndSentMessageKeys = new Set<string>();
+
+export function sanitizeVoiceDuration(rawDuration?: string | null): string {
+  const cleaned = String(rawDuration || '').trim();
+  if (!cleaned || cleaned === 'undefined' || cleaned === 'null' || cleaned === 'NaN') {
+    return '0:05';
+  }
+  return cleaned.slice(0, 20);
+}
+
 export async function sendAuthorizedMessageToChatRoom(params: {
   chatId: string;
   messageId: string;
@@ -1765,8 +1995,17 @@ export async function sendAuthorizedMessageToChatRoom(params: {
   recipientUid: string;
   senderName: string;
   senderUsername: string;
+  senderAvatar?: string;
   text: string;
   messageType: 'text' | 'voice' | 'image' | 'file' | 'poll' | 'sticker';
+  voiceDuration?: string;
+  imageUrl?: string;
+  imageCaption?: string;
+  stickerId?: string;
+  stickerEmoji?: string;
+  stickerLabel?: string;
+  stickerGradient?: string;
+  stickerPackId?: string;
   displayTime: string;
 }): Promise<void> {
   if (!auth.currentUser || auth.currentUser.uid !== params.senderUid) {
@@ -1775,17 +2014,25 @@ export async function sendAuthorizedMessageToChatRoom(params: {
   if (!auth.currentUser.emailVerified) {
     throw new Error('يرجى تأكيد البريد الإلكتروني أولاً قبل إرسال الرسائل.');
   }
+
+  const safeChatId = sanitizeDocId(params.chatId);
+  const safeMsgId = sanitizeDocId(params.messageId);
+  const dedupeKey = `${safeChatId}:${safeMsgId}`;
+  if (inFlightAndSentMessageKeys.has(dedupeKey)) {
+    return;
+  }
+  inFlightAndSentMessageKeys.add(dedupeKey);
+
   const hasValidToken = await ensureValidAuthTokenForFirestore({
     requireEmailVerifiedClaim: true,
   });
   if (!hasValidToken || !auth.currentUser) {
+    inFlightAndSentMessageKeys.delete(dedupeKey);
     throw new Error(
       'يرجى تسجيل الدخول مرة أخرى لتحديث جلسة الأمان قبل إرسال الرسائل.'
     );
   }
 
-  const safeChatId = sanitizeDocId(params.chatId);
-  const safeMsgId = sanitizeDocId(params.messageId);
   const msgPath = `chats/${safeChatId}/messages/${safeMsgId}`;
   const msgRef = doc(db, 'chats', safeChatId, 'messages', safeMsgId);
   const chatRef = doc(db, 'chats', safeChatId);
@@ -1796,35 +2043,67 @@ export async function sendAuthorizedMessageToChatRoom(params: {
     sanitizeUsername(params.senderUsername) || 'user_chat';
   const safeTime = (params.displayTime || 'الآن').slice(0, 40);
 
+  const payload: Record<string, any> = {
+    chatId: safeChatId,
+    senderUid: params.senderUid,
+    recipientUid: params.recipientUid,
+    senderName: safeSenderName,
+    senderUsername: safeSenderUsername,
+    text: safeText,
+    messageType: params.messageType,
+    displayTime: safeTime,
+    isStarred: false,
+    isPinned: false,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+
+  if (params.senderAvatar) {
+    payload.senderAvatar = String(params.senderAvatar).slice(0, 240000);
+  }
+  if (params.messageType === 'voice') {
+    payload.voiceDuration = sanitizeVoiceDuration(params.voiceDuration);
+  }
+  if (params.messageType === 'image' && params.imageUrl) {
+    payload.imageUrl = String(params.imageUrl).slice(0, 340000);
+    if (params.imageCaption) {
+      payload.imageCaption = String(params.imageCaption).slice(0, 500);
+    }
+  }
+  if (params.messageType === 'sticker') {
+    if (params.stickerId) payload.stickerId = String(params.stickerId).slice(0, 60);
+    if (params.stickerEmoji) payload.stickerEmoji = String(params.stickerEmoji).slice(0, 40);
+    if (params.stickerLabel) payload.stickerLabel = String(params.stickerLabel).slice(0, 100);
+    if (params.stickerGradient) payload.stickerGradient = String(params.stickerGradient).slice(0, 160);
+    if (params.stickerPackId) payload.stickerPackId = String(params.stickerPackId).slice(0, 40);
+  }
+
   try {
-    await setDoc(msgRef, {
-      chatId: safeChatId,
-      senderUid: params.senderUid,
-      recipientUid: params.recipientUid,
-      senderName: safeSenderName,
-      senderUsername: safeSenderUsername,
-      text: safeText,
-      messageType: params.messageType,
-      displayTime: safeTime,
-      isStarred: false,
-      isPinned: false,
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    });
+    await setDoc(msgRef, payload);
 
     const chatSnap = await getDoc(chatRef);
     if (chatSnap.exists()) {
       const cData = chatSnap.data();
-      await updateDoc(chatRef, {
+      const isMeOne = cData.participantOneUid === params.senderUid;
+      const updatePayload: Record<string, any> = {
         lastMessageText: safeText.slice(0, 500),
         lastMessageSenderUid: params.senderUid,
         lastMessageTime: safeTime,
-        participantOneName: cData.participantOneName,
-        participantTwoName: cData.participantTwoName,
+        participantOneName: isMeOne ? safeSenderName : cData.participantOneName,
+        participantTwoName: isMeOne ? cData.participantTwoName : safeSenderName,
         updatedAt: serverTimestamp(),
-      });
+      };
+      if (params.senderAvatar) {
+        if (isMeOne) {
+          updatePayload.participantOneAvatar = String(params.senderAvatar).slice(0, 240000);
+        } else {
+          updatePayload.participantTwoAvatar = String(params.senderAvatar).slice(0, 240000);
+        }
+      }
+      await updateDoc(chatRef, updatePayload);
     }
   } catch (error) {
+    inFlightAndSentMessageKeys.delete(dedupeKey);
     handleFirestoreError(error, OperationType.CREATE, msgPath);
   }
 }
@@ -1837,8 +2116,10 @@ export function subscribeToAuthorizedChatRooms(
       otherUid: string;
       otherName: string;
       otherUsername: string;
+      otherAvatar: string;
       lastMessageText: string;
       lastMessageTime: string;
+      updatedAt?: number;
     }>
   ) => void
 ): () => void {
@@ -1860,15 +2141,24 @@ export function subscribeToAuthorizedChatRooms(
     const combined = new Map<string, any>([...map1, ...map2]);
     const list = Array.from(combined.values()).map((d) => {
       const isOne = d.participantOneUid === uid;
+      const otherUid = String(isOne ? d.participantTwoUid : d.participantOneUid);
+      const otherName = String(isOne ? d.participantTwoName : d.participantOneName);
+      const rawOtherAvatar = String(
+        isOne ? d.participantTwoAvatar || '' : d.participantOneAvatar || ''
+      );
       return {
         chatId: String(d.chatId),
-        otherUid: String(isOne ? d.participantTwoUid : d.participantOneUid),
-        otherName: String(isOne ? d.participantTwoName : d.participantOneName),
+        otherUid,
+        otherName,
         otherUsername: String(
           isOne ? d.participantTwoUsername : d.participantOneUsername
         ),
+        otherAvatar: normalizeUserAvatarUrl(rawOtherAvatar, otherUid, otherName),
         lastMessageText: String(d.lastMessageText || ''),
         lastMessageTime: String(d.lastMessageTime || 'الآن'),
+        updatedAt: d.updatedAt?.toMillis
+          ? d.updatedAt.toMillis()
+          : Number(d.updatedAt || 0),
       };
     });
     onRoomsChanged(list);
@@ -1910,8 +2200,17 @@ export function subscribeToAuthorizedDirectMessages(
       recipientUid: string;
       senderName: string;
       senderUsername: string;
+      senderAvatar?: string;
       text: string;
       messageType: 'text' | 'voice' | 'image' | 'file' | 'poll' | 'sticker';
+      voiceDuration?: string;
+      imageUrl?: string;
+      imageCaption?: string;
+      stickerId?: string;
+      stickerEmoji?: string;
+      stickerLabel?: string;
+      stickerGradient?: string;
+      stickerPackId?: string;
       displayTime: string;
       isStarred: boolean;
       isPinned: boolean;
@@ -1938,25 +2237,46 @@ export function subscribeToAuthorizedDirectMessages(
   const emitMerged = () => {
     const merged = new Map<string, any>([...sentMap, ...recvMap]);
     const items = Array.from(merged.entries())
-      .map(([id, d]) => ({
-        id,
-        senderUid: String(d.senderUid || ''),
-        recipientUid: String(d.recipientUid || ''),
-        senderName: String(d.senderName || ''),
-        senderUsername: String(d.senderUsername || ''),
-        text: String(d.text || ''),
-        messageType: (d.messageType || 'text') as
+      .map(([id, d]) => {
+        const msgType = (d.messageType || 'text') as
           | 'text'
           | 'voice'
           | 'image'
           | 'file'
           | 'poll'
-          | 'sticker',
-        displayTime: String(d.displayTime || 'الآن'),
-        isStarred: Boolean(d.isStarred),
-        isPinned: Boolean(d.isPinned),
-        createdAtMs: d.createdAt?.toMillis ? d.createdAt.toMillis() : 0,
-      }))
+          | 'sticker';
+        let cleanText = String(d.text || '');
+        if (msgType === 'voice') {
+          cleanText = cleanText.replace(/\(undefined\)/gi, '').trim() || 'رسالة صوتية';
+        }
+        return {
+          id,
+          senderUid: String(d.senderUid || ''),
+          recipientUid: String(d.recipientUid || ''),
+          senderName: String(d.senderName || ''),
+          senderUsername: String(d.senderUsername || ''),
+          senderAvatar: d.senderAvatar ? String(d.senderAvatar) : undefined,
+          text: cleanText,
+          messageType: msgType,
+          voiceDuration:
+            msgType === 'voice'
+              ? sanitizeVoiceDuration(d.voiceDuration)
+              : undefined,
+          imageUrl: d.imageUrl ? String(d.imageUrl) : undefined,
+          imageCaption: d.imageCaption ? String(d.imageCaption) : undefined,
+          stickerId: d.stickerId ? String(d.stickerId) : undefined,
+          stickerEmoji: d.stickerEmoji ? String(d.stickerEmoji) : undefined,
+          stickerLabel: d.stickerLabel ? String(d.stickerLabel) : undefined,
+          stickerGradient: d.stickerGradient ? String(d.stickerGradient) : undefined,
+          stickerPackId: d.stickerPackId ? String(d.stickerPackId) : undefined,
+          displayTime: String(d.displayTime || 'الآن'),
+          isStarred: Boolean(d.isStarred),
+          isPinned: Boolean(d.isPinned),
+          createdAtMs: d.createdAt?.toMillis
+            ? d.createdAt.toMillis()
+            : Number(d.createdAtMs || 0),
+        };
+      })
       .sort((a, b) => a.createdAtMs - b.createdAtMs);
     onMessagesChanged(items);
   };
@@ -2001,7 +2321,7 @@ export async function saveContactToFirestore(
   });
   if (!hasValidToken || !auth.currentUser) return;
 
-  const safeContactId = sanitizeDocId(contact.id);
+  const safeContactId = sanitizeDocId(contact.uid || contact.id);
   const path = `users/${uid}/contacts/${safeContactId}`;
   const contactRef = doc(db, 'users', uid, 'contacts', safeContactId);
 
@@ -2015,6 +2335,12 @@ export async function saveContactToFirestore(
     0,
     40
   );
+  const safeAvatar = normalizeUserAvatarUrl(
+    contact.avatar,
+    contact.uid || contact.id,
+    safeName
+  ).slice(0, 240000);
+  const safeUsername = sanitizeUsername(contact.username || '').slice(0, 40);
 
   try {
     const parentUserSnap = await getDoc(doc(db, 'users', uid));
@@ -2027,6 +2353,8 @@ export async function saveContactToFirestore(
         contactName: safeName,
         contactPhone: safePhone,
         contactBio: safeBio,
+        contactAvatar: safeAvatar,
+        contactUsername: safeUsername,
         avatarFallbackColor: safeColor,
         isMuted: Boolean(contact.isMuted),
         isBlocked: Boolean(contact.isBlocked),
@@ -2038,6 +2366,8 @@ export async function saveContactToFirestore(
       await updateDoc(contactRef, {
         contactName: safeName,
         contactBio: safeBio,
+        contactAvatar: safeAvatar,
+        contactUsername: safeUsername,
         isMuted: Boolean(contact.isMuted),
         isBlocked: Boolean(contact.isBlocked),
         isPinned: Boolean(contact.isPinned),
@@ -2087,6 +2417,9 @@ export async function saveMessageToFirestore(
     : 'text';
 
   try {
+    const contactSnap = await getDoc(doc(db, 'users', uid, 'contacts', safeContactId));
+    if (!contactSnap.exists()) return;
+
     await setDoc(msgRef, {
       ownerUid: uid,
       contactId: safeContactId,
@@ -2177,6 +2510,115 @@ export async function deleteMessageFromFirestore(
   }
 }
 
+/**
+ * Clears all messages in a conversation in Firestore after verifying current user authorization.
+ * - If scope === 'me': records `clearedAtMs` on the user's contact record and deletes their private `/users/{uid}/contacts/{contactId}/messages` copies.
+ * - If scope === 'both': also deletes the shared `/chats/{chatId}/messages` documents and resets `lastMessageText` on `/chats/{chatId}`.
+ */
+export async function clearConversationInFirestore(params: {
+  myUid: string;
+  contactId: string;
+  otherUid?: string;
+  scope: 'me' | 'both';
+}): Promise<number> {
+  if (!auth.currentUser || auth.currentUser.uid !== params.myUid) {
+    throw new Error('غير مصرح لك بمسح هذه المحادثة. يرجى التحقق من تسجيل الدخول.');
+  }
+  const hasValidToken = await ensureValidAuthTokenForFirestore({
+    requireEmailVerifiedClaim: true,
+  });
+  if (!hasValidToken || !auth.currentUser) {
+    throw new Error('يرجى تسجيل الدخول مجدداً لتأكيد صلاحية مسح المحادثة.');
+  }
+
+  const nowMs = Date.now();
+  const safeContactId = sanitizeDocId(params.contactId);
+  const contactRef = doc(db, 'users', params.myUid, 'contacts', safeContactId);
+
+  // 1. Delete owner-workspace messages & record clearedAtMs on contact doc
+  try {
+    const contactSnap = await getDoc(contactRef);
+    if (contactSnap.exists() && contactSnap.data().ownerUid === params.myUid) {
+      await updateDoc(contactRef, {
+        clearedAtMs: nowMs,
+        updatedAt: serverTimestamp(),
+      });
+      const qPrivateMsgs = query(
+        collection(db, 'users', params.myUid, 'contacts', safeContactId, 'messages'),
+        where('ownerUid', '==', params.myUid)
+      );
+      const privSnap = await getDocs(qPrivateMsgs);
+      for (const mDoc of privSnap.docs) {
+        await deleteDoc(mDoc.ref).catch(() => {});
+      }
+    }
+  } catch {
+    // non-fatal if contact wasn't persisted in subcollection yet
+  }
+
+  // 2. If scope === 'both' and this is a 2-participant chat room, delete shared messages in /chats/{chatId}/messages
+  if (params.scope === 'both' && params.otherUid && params.otherUid !== params.myUid) {
+    const chatId = buildDeterministicChatId(params.myUid, params.otherUid);
+    const safeChatId = sanitizeDocId(chatId);
+    const chatRef = doc(db, 'chats', safeChatId);
+    try {
+      const chatSnap = await getDoc(chatRef);
+      if (
+        chatSnap.exists() &&
+        (chatSnap.data().participantOneUid === params.myUid ||
+          chatSnap.data().participantTwoUid === params.myUid)
+      ) {
+        const qSent = query(
+          collection(db, 'chats', safeChatId, 'messages'),
+          where('senderUid', '==', params.myUid)
+        );
+        const qRecv = query(
+          collection(db, 'chats', safeChatId, 'messages'),
+          where('recipientUid', '==', params.myUid)
+        );
+        const [sSent, sRecv] = await Promise.all([getDocs(qSent), getDocs(qRecv)]);
+        const allDocs = [...sSent.docs, ...sRecv.docs];
+        for (const mDoc of allDocs) {
+          await deleteDoc(mDoc.ref).catch(() => {});
+        }
+        await updateDoc(chatRef, {
+          lastMessageText: '',
+          lastMessageSenderUid: params.myUid,
+          lastMessageTime: 'الآن',
+          updatedAt: serverTimestamp(),
+        }).catch(() => {});
+      }
+    } catch {
+      // ignore if chat room doesn't exist in Firestore yet
+    }
+  }
+
+  return nowMs;
+}
+
+/**
+ * Deletes a specific conversation from the user's contact list in Firestore (and optionally clears messages for both sides).
+ */
+export async function deleteConversationFromFirestore(params: {
+  myUid: string;
+  contactId: string;
+  otherUid?: string;
+  scope: 'me' | 'both';
+}): Promise<number> {
+  const clearedAtMs = await clearConversationInFirestore(params);
+  const safeContactId = sanitizeDocId(params.contactId);
+  const contactRef = doc(db, 'users', params.myUid, 'contacts', safeContactId);
+  try {
+    const snap = await getDoc(contactRef);
+    if (snap.exists() && snap.data().ownerUid === params.myUid) {
+      await deleteDoc(contactRef);
+    }
+  } catch {
+    // non-fatal
+  }
+  return clearedAtMs;
+}
+
 export function subscribeToUserContacts(
   uid: string,
   onContactsSnapshot: (
@@ -2185,6 +2627,9 @@ export function subscribeToUserContacts(
       contactName: string;
       contactPhone: string;
       contactBio: string;
+      contactAvatar: string;
+      contactUsername: string;
+      clearedAtMs: number;
       avatarFallbackColor: string;
       isMuted: boolean;
       isBlocked: boolean;
@@ -2202,11 +2647,19 @@ export function subscribeToUserContacts(
     (snapshot) => {
       const items = snapshot.docs.map((d) => {
         const data = d.data();
+        const contactName = String(data.contactName || '');
         return {
           id: d.id,
-          contactName: String(data.contactName || ''),
-          contactPhone: String(data.contactPhone || ''),
+          contactName,
+          contactPhone: formatDisplayPhone(String(data.contactPhone || '')),
           contactBio: String(data.contactBio || ''),
+          contactAvatar: normalizeUserAvatarUrl(
+            String(data.contactAvatar || ''),
+            d.id,
+            contactName
+          ),
+          contactUsername: String(data.contactUsername || ''),
+          clearedAtMs: Number(data.clearedAtMs || 0),
           avatarFallbackColor: String(
             data.avatarFallbackColor || 'bg-emerald-600'
           ),
@@ -2219,6 +2672,48 @@ export function subscribeToUserContacts(
     },
     (error) => {
       handleFirestoreError(error, OperationType.LIST, path);
+    }
+  );
+}
+
+/**
+ * Subscribes in real-time to a target user's public `/directory/{targetUid}` document
+ * so that when the other user changes their profile picture, name, or bio,
+ * it immediately updates in the chat list and chat header.
+ */
+export function subscribeToPublicDirectoryUser(
+  targetUid: string,
+  onProfileUpdate: (profile: PublicDirectoryUser) => void
+): () => void {
+  if (!auth.currentUser || !targetUid) return () => {};
+  const safeUid = sanitizeDocId(targetUid);
+  if (!safeUid || safeUid.startsWith('c') || safeUid.startsWith('u_')) {
+    return () => {};
+  }
+  const dirRef = doc(db, 'directory', safeUid);
+  return onSnapshot(
+    dirRef,
+    (snap) => {
+      if (!snap.exists()) return;
+      const d = snap.data();
+      const displayName = String(d.displayName || d.username || '');
+      onProfileUpdate({
+        uid: String(d.uid || safeUid),
+        username: String(d.username || ''),
+        displayName,
+        bio: String(d.bio || ''),
+        avatarFallbackColor: String(d.avatarFallbackColor || 'bg-emerald-600'),
+        emailVerified: Boolean(d.emailVerified),
+        phoneVerified: false,
+        avatarUrl: normalizeUserAvatarUrl(
+          String(d.avatarUrl || ''),
+          String(d.uid || safeUid),
+          displayName
+        ),
+      });
+    },
+    () => {
+      // Ignore permission or network errors on individual directory doc watch
     }
   );
 }
@@ -2240,6 +2735,8 @@ export async function ensureAuthorizedChatRoomInFirestore(params: {
   otherName?: string;
   myUsername?: string;
   otherUsername?: string;
+  myAvatar?: string;
+  otherAvatar?: string;
 }): Promise<string> {
   const safeMyUsername =
     sanitizeUsername(params.myUsername || '') ||
@@ -2251,9 +2748,11 @@ export async function ensureAuthorizedChatRoomInFirestore(params: {
     myUid: params.myUid,
     myName: params.myName || auth.currentUser?.displayName || safeMyUsername,
     myUsername: safeMyUsername,
+    myAvatar: params.myAvatar,
     otherUid: params.otherUid,
     otherName: params.otherName || safeOtherUsername,
     otherUsername: safeOtherUsername,
+    otherAvatar: params.otherAvatar,
   });
 }
 
@@ -2263,10 +2762,19 @@ export async function sendDirectMessageToAuthorizedChat(params: {
   recipientUid: string;
   senderName: string;
   senderUsername?: string;
+  senderAvatar?: string;
   recipientName?: string;
   recipientUsername?: string;
   text: string;
   type?: 'text' | 'voice' | 'image' | 'file' | 'poll' | 'sticker';
+  voiceDuration?: string;
+  imageUrl?: string;
+  imageCaption?: string;
+  stickerId?: string;
+  stickerEmoji?: string;
+  stickerLabel?: string;
+  stickerGradient?: string;
+  stickerPackId?: string;
   displayTime?: string;
 }): Promise<void> {
   const chatId = await ensureAuthorizedChatRoomInFirestore({
@@ -2274,6 +2782,7 @@ export async function sendDirectMessageToAuthorizedChat(params: {
     otherUid: params.recipientUid,
     myName: params.senderName,
     myUsername: params.senderUsername,
+    myAvatar: params.senderAvatar,
     otherName: params.recipientName,
     otherUsername: params.recipientUsername,
   });
@@ -2294,8 +2803,17 @@ export async function sendDirectMessageToAuthorizedChat(params: {
     recipientUid: params.recipientUid,
     senderName: params.senderName,
     senderUsername: safeSenderUsername,
+    senderAvatar: params.senderAvatar,
     text: params.text,
     messageType: params.type || 'text',
+    voiceDuration: params.voiceDuration,
+    imageUrl: params.imageUrl,
+    imageCaption: params.imageCaption,
+    stickerId: params.stickerId,
+    stickerEmoji: params.stickerEmoji,
+    stickerLabel: params.stickerLabel,
+    stickerGradient: params.stickerGradient,
+    stickerPackId: params.stickerPackId,
     displayTime: timeStr,
   });
 }
@@ -2308,9 +2826,20 @@ export function subscribeToAuthorizedChatMessages(
       senderUid: string;
       recipientUid: string;
       senderName: string;
+      senderAvatar?: string;
       text: string;
       displayTime: string;
       type: 'text' | 'voice' | 'image' | 'sticker';
+      voiceDuration?: string;
+      imageUrl?: string;
+      imageCaption?: string;
+      stickerId?: string;
+      stickerEmoji?: string;
+      stickerLabel?: string;
+      stickerGradient?: string;
+      stickerPackId?: string;
+      isStarred?: boolean;
+      isPinned?: boolean;
       createdAt: number;
     }>
   ) => void
@@ -2324,6 +2853,7 @@ export function subscribeToAuthorizedChatMessages(
         senderUid: m.senderUid,
         recipientUid: m.recipientUid,
         senderName: m.senderName,
+        senderAvatar: m.senderAvatar,
         text: m.text,
         displayTime: m.displayTime,
         type:
@@ -2332,6 +2862,16 @@ export function subscribeToAuthorizedChatMessages(
           m.messageType === 'sticker'
             ? m.messageType
             : 'text',
+        voiceDuration: m.voiceDuration,
+        imageUrl: m.imageUrl,
+        imageCaption: m.imageCaption,
+        stickerId: m.stickerId,
+        stickerEmoji: m.stickerEmoji,
+        stickerLabel: m.stickerLabel,
+        stickerGradient: m.stickerGradient,
+        stickerPackId: m.stickerPackId,
+        isStarred: m.isStarred,
+        isPinned: m.isPinned,
         createdAt: m.createdAtMs || Date.now(),
       }))
     );
@@ -2349,6 +2889,7 @@ export function subscribeToFirestoreUsers(
       username: string;
       bio: string;
       avatar: string;
+      clearedAtMs?: number;
       isOnline: boolean;
       lastSeen: string;
     }>
@@ -2364,9 +2905,10 @@ export function subscribeToFirestoreUsers(
         name: c.contactName,
         phone: c.contactPhone,
         normalizedPhone: c.contactPhone.replace(/\D/g, ''),
-        username: sanitizeUsername(c.contactName) || c.id,
+        username: c.contactUsername || sanitizeUsername(c.contactName) || c.id,
         bio: c.contactBio,
-        avatar: '',
+        avatar: c.contactAvatar,
+        clearedAtMs: c.clearedAtMs,
         isOnline: true,
         lastSeen: 'موثق في Firestore',
       }))
@@ -2374,6 +2916,10 @@ export function subscribeToFirestoreUsers(
   });
 }
 
+/**
+ * Subscribes to active 2-participant chat rooms so new incoming chat rooms appear in the user's contact list
+ * without generating synthetic duplicate messages (`room_${chatId}`).
+ */
 export function subscribeToFirestoreMessages(
   onMessagesSnapshot: (
     cloudMsgs: Array<{
@@ -2387,23 +2933,9 @@ export function subscribeToFirestoreMessages(
     }>
   ) => void
 ): () => void {
-  const uid = auth.currentUser?.uid || '';
-  if (!uid || !auth.currentUser?.emailVerified) return () => {};
-  return subscribeToAuthorizedChatRooms(uid, (rooms) => {
-    onMessagesSnapshot(
-      rooms
-        .filter((r) => Boolean(r.lastMessageText))
-        .map((r) => ({
-          id: `room_${r.chatId}`,
-          senderPhone: r.otherUid,
-          senderName: r.otherName,
-          recipientPhone: uid,
-          text: r.lastMessageText,
-          timestamp: r.lastMessageTime,
-          type: 'text' as const,
-        }))
-    );
-  });
+  // Intentionally returns a no-op for synthetic room messages so chat room metadata never creates fake messages.
+  void onMessagesSnapshot;
+  return () => {};
 }
 
 // Compatibility helpers used by App.tsx
@@ -2441,6 +2973,7 @@ export async function syncUserToFirestore(user: {
     bio: user.bio,
     wallpaperTheme: 'aurora-borealis',
     phoneVerified: false,
+    avatarUrl: user.avatar,
   }).catch(() => {});
 }
 
@@ -2449,33 +2982,114 @@ export async function syncContactToFirestore(contact: Contact): Promise<void> {
   await saveContactToFirestore(auth.currentUser.uid, contact).catch(() => {});
 }
 
+export async function updateUserProfileAndSyncAvatarInFirestore(params: {
+  uid?: string;
+  name: string;
+  phone: string;
+  username?: string;
+  email?: string;
+  bio: string;
+  avatarUrl: string;
+}): Promise<void> {
+  await syncUserToFirestore({
+    name: params.name,
+    phone: params.phone,
+    username: params.username,
+    email: params.email,
+    bio: params.bio,
+    avatar: params.avatarUrl,
+    phoneVerified: false,
+  });
+}
+
+export async function clearAuthorizedChatMessagesInFirestore(params: {
+  myUid: string;
+  otherUid?: string;
+  contactId?: string;
+  scope: 'me' | 'both';
+}): Promise<number> {
+  return clearConversationInFirestore({
+    myUid: params.myUid,
+    contactId: params.contactId || params.otherUid || 'chat',
+    otherUid: params.otherUid,
+    scope: params.scope,
+  });
+}
+
+export async function deleteSavedContactFromFirestore(
+  myUid: string,
+  contactId: string,
+  otherUid?: string,
+  scope: 'me' | 'both' = 'me'
+): Promise<number> {
+  return deleteConversationFromFirestore({
+    myUid,
+    contactId,
+    otherUid,
+    scope,
+  });
+}
+
+export function subscribeToSavedContacts(
+  uid: string,
+  onSavedContacts: (
+    savedList: Array<{
+      id: string;
+      name: string;
+      phone: string;
+      bio: string;
+      avatar: string;
+      username: string;
+      clearedAtMs: number;
+      isMuted: boolean;
+      isBlocked: boolean;
+      isPinned: boolean;
+    }>
+  ) => void
+): () => void {
+  if (!uid || !auth.currentUser || auth.currentUser.uid !== uid) {
+    return () => {};
+  }
+  return subscribeToUserContacts(uid, (items) => {
+    onSavedContacts(
+      items.map((c) => ({
+        id: c.id,
+        name: c.contactName,
+        phone: c.contactPhone,
+        bio: c.contactBio,
+        avatar: c.contactAvatar,
+        username: c.contactUsername,
+        clearedAtMs: c.clearedAtMs,
+        isMuted: c.isMuted,
+        isBlocked: c.isBlocked,
+        isPinned: c.isPinned,
+      }))
+    );
+  });
+}
+
 export async function sendMessageToFirestore(msg: {
   id: string;
   senderPhone: string;
   senderName: string;
+  senderAvatar?: string;
   recipientPhone: string;
   recipientUid?: string;
   senderUsername?: string;
   text: string;
   timestamp: string;
   type: 'text' | 'voice' | 'image' | 'sticker';
+  voiceDuration?: string;
+  imageUrl?: string;
+  imageCaption?: string;
+  stickerId?: string;
+  stickerEmoji?: string;
+  stickerLabel?: string;
+  stickerGradient?: string;
+  stickerPackId?: string;
 }): Promise<void> {
   if (!auth.currentUser || !auth.currentUser.emailVerified) return;
   const myUid = auth.currentUser.uid;
-  if (msg.recipientUid && msg.recipientUid !== myUid) {
-    const chatId = buildDeterministicChatId(myUid, msg.recipientUid);
-    await sendAuthorizedMessageToChatRoom({
-      chatId,
-      messageId: msg.id,
-      senderUid: myUid,
-      recipientUid: msg.recipientUid,
-      senderName: msg.senderName,
-      senderUsername: msg.senderUsername || 'user_chat',
-      text: msg.text,
-      messageType: msg.type,
-      displayTime: msg.timestamp,
-    }).catch(() => {});
-  }
   await saveMessageToFirestore(
     myUid,
     msg.recipientUid || msg.recipientPhone,
@@ -2483,10 +3097,19 @@ export async function sendMessageToFirestore(msg: {
       id: msg.id,
       senderId: 'me',
       senderName: msg.senderName,
+      senderAvatar: msg.senderAvatar,
       text: msg.text,
       timestamp: msg.timestamp,
       status: 'sent',
       type: msg.type,
+      voiceDuration: msg.voiceDuration,
+      imageUrl: msg.imageUrl,
+      imageCaption: msg.imageCaption,
+      stickerId: msg.stickerId,
+      stickerEmoji: msg.stickerEmoji,
+      stickerLabel: msg.stickerLabel,
+      stickerGradient: msg.stickerGradient,
+      stickerPackId: msg.stickerPackId,
       reactions: [],
     },
     msg.senderName

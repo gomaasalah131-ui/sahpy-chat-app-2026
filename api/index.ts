@@ -636,9 +636,66 @@ app.post('/api/messages', (req, res) => {
     res.status(400).json({ error: 'بيانات الرسالة غير مكتملة' });
     return;
   }
+  if (msg.type === 'voice') {
+    msg.voiceDuration =
+      !msg.voiceDuration || msg.voiceDuration === 'undefined'
+        ? '0:05'
+        : msg.voiceDuration;
+    msg.text =
+      String(msg.text || '')
+        .replace(/\(undefined\)/gi, '')
+        .trim() || 'رسالة صوتية';
+  }
+  const existing = store.messages.find((m) => m.id === msg.id);
+  if (existing) {
+    res.json({ message: existing });
+    return;
+  }
   store.messages.push(msg);
   saveStore(store);
   res.json({ message: msg });
+});
+
+app.post('/api/chats/clear', (req, res) => {
+  const store = loadStore();
+  const { myUid, myPhone, otherUid, otherPhone, groupId, scope } =
+    req.body || {};
+  if (!myUid && !myPhone) {
+    res.status(400).json({ error: 'غير مصرح بتنفيذ هذه العملية.' });
+    return;
+  }
+  if (scope === 'both') {
+    const normMy = normalizeDigits(String(myPhone || ''));
+    const normOther = normalizeDigits(String(otherPhone || ''));
+    store.messages = store.messages.filter((m) => {
+      if (groupId && m.groupId === groupId) {
+        return false;
+      }
+      const mSenderUid = String(m.senderUid || m.senderPhone || '');
+      const mRecipUid = String(m.recipientUid || m.recipientPhone || '');
+      if (
+        myUid &&
+        otherUid &&
+        ((mSenderUid === myUid && mRecipUid === otherUid) ||
+          (mSenderUid === otherUid && mRecipUid === myUid))
+      ) {
+        return false;
+      }
+      const sDigits = normalizeDigits(m.senderPhone);
+      const rDigits = normalizeDigits(m.recipientPhone);
+      if (
+        normMy &&
+        normOther &&
+        ((sDigits === normMy && rDigits === normOther) ||
+          (sDigits === normOther && rDigits === normMy))
+      ) {
+        return false;
+      }
+      return true;
+    });
+    saveStore(store);
+  }
+  res.json({ ok: true });
 });
 
 app.get('/api/messages', (req, res) => {

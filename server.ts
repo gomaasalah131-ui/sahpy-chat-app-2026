@@ -310,8 +310,20 @@ async function startServer() {
           }
         } else if (data.type === 'chat:message' && data.message) {
           const msg: ChatMessagePayload = data.message;
-          store.messages.push(msg);
-          saveStore(store);
+          if (msg.type === 'voice') {
+            msg.voiceDuration =
+              !msg.voiceDuration || msg.voiceDuration === 'undefined'
+                ? '0:05'
+                : msg.voiceDuration;
+            msg.text =
+              String(msg.text || '')
+                .replace(/\(undefined\)/gi, '')
+                .trim() || 'رسالة صوتية';
+          }
+          if (!store.messages.some((existingMsg) => existingMsg.id === msg.id)) {
+            store.messages.push(msg);
+            saveStore(store);
+          }
           broadcast({ type: 'message:new', message: msg });
         }
       } catch (e) {
@@ -490,8 +502,10 @@ async function startServer() {
       existing.isOnline = true;
       existing.lastSeen = 'متصل الآن';
       saveStore(store);
+      const pubUser = toPublicUser(existing);
+      broadcast({ type: 'user:update', user: pubUser });
       res.json({
-        user: toPublicUser(existing),
+        user: pubUser,
         users: [],
         isNew: false,
       });
@@ -656,10 +670,74 @@ async function startServer() {
       res.status(400).json({ error: 'بيانات الرسالة غير مكتملة' });
       return;
     }
+    if (msg.type === 'voice') {
+      msg.voiceDuration =
+        !msg.voiceDuration || msg.voiceDuration === 'undefined'
+          ? '0:05'
+          : msg.voiceDuration;
+      msg.text =
+        String(msg.text || '')
+          .replace(/\(undefined\)/gi, '')
+          .trim() || 'رسالة صوتية';
+    }
+    const existing = store.messages.find((m) => m.id === msg.id);
+    if (existing) {
+      res.json({ message: existing });
+      return;
+    }
     store.messages.push(msg);
     saveStore(store);
     broadcast({ type: 'message:new', message: msg });
     res.json({ message: msg });
+  });
+
+  // REST API: Clear or delete conversation messages
+  app.post('/api/chats/clear', (req, res) => {
+    const { myUid, myPhone, otherUid, otherPhone, groupId, scope } =
+      req.body || {};
+    if (!myUid && !myPhone) {
+      res.status(400).json({ error: 'غير مصرح بتنفيذ هذه العملية.' });
+      return;
+    }
+    if (scope === 'both') {
+      const normMy = normalizeDigits(String(myPhone || ''));
+      const normOther = normalizeDigits(String(otherPhone || ''));
+      store.messages = store.messages.filter((m) => {
+        if (groupId && m.groupId === groupId) {
+          return false;
+        }
+        const mSenderUid = String(m.senderUid || m.senderPhone || '');
+        const mRecipUid = String(m.recipientUid || m.recipientPhone || '');
+        if (
+          myUid &&
+          otherUid &&
+          ((mSenderUid === myUid && mRecipUid === otherUid) ||
+            (mSenderUid === otherUid && mRecipUid === myUid))
+        ) {
+          return false;
+        }
+        const sDigits = normalizeDigits(m.senderPhone);
+        const rDigits = normalizeDigits(m.recipientPhone);
+        if (
+          normMy &&
+          normOther &&
+          ((sDigits === normMy && rDigits === normOther) ||
+            (sDigits === normOther && rDigits === normMy))
+        ) {
+          return false;
+        }
+        return true;
+      });
+      saveStore(store);
+      broadcast({
+        type: 'chat:clear',
+        myUid,
+        otherUid,
+        groupId,
+        scope: 'both',
+      });
+    }
+    res.json({ ok: true });
   });
 
   // REST API: Get messages

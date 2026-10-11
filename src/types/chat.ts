@@ -60,6 +60,7 @@ export interface Message {
   };
   isStarred?: boolean;
   isPinned?: boolean;
+  createdAtMs?: number;
 }
 
 export interface SharedMediaItem {
@@ -110,6 +111,7 @@ export interface Contact {
   groupMembers?: GroupMember[];
   groupAdminPhone?: string;
   customWallpaper?: WallpaperThemeId;
+  clearedAtMs?: number;
   messages: Message[];
   sharedMedia: SharedMediaItem[];
 }

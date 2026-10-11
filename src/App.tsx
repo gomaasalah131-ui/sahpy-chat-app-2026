@@ -67,6 +67,7 @@ import {
   CreateGroupModal,
   CreateGroupSelectionItem,
   ProfileModal,
+  ClearOrDeleteChatModal,
 } from './components/InteractiveModals';
 import {
   PhoneRegistrationScreen,
@@ -92,6 +93,11 @@ import {
   sendMessageToFirestore,
   subscribeToFirestoreUsers,
   subscribeToFirestoreMessages,
+  normalizeUserAvatarUrl,
+  updateUserProfileAndSyncAvatarInFirestore,
+  clearAuthorizedChatMessagesInFirestore,
+  deleteSavedContactFromFirestore,
+  subscribeToSavedContacts,
 } from './lib/firebase';
 
 import ahmedAvatar from './assets/images/avatar_ahmed_profile_1791581695415.jpg';
@@ -311,9 +317,65 @@ function getRemainingHoursBadge(expiresAt?: number): string {
   return `${hours}س`;
 }
 
+export function formatSafeVoiceDuration(dur?: string): string {
+  if (!dur || typeof dur !== 'string') return '0:05';
+  const trimmed = dur.trim();
+  if (
+    !trimmed ||
+    trimmed === 'undefined' ||
+    trimmed === 'null' ||
+    trimmed === 'NaN' ||
+    trimmed.includes('undefined')
+  ) {
+    return '0:05';
+  }
+  return trimmed;
+}
+
 export default function App() {
   // View mode ('registration' shows Login & Sign Up with Gmail, 'chat' shows SAHPY-CHAT)
-  const [viewMode, setViewMode] = useState<'registration' | 'chat'>('registration');
+  const [viewMode, setViewMode] = useState<'registration' | 'chat'>(() =>
+    localStorage.getItem('nabd_user_uid') ? 'chat' : 'registration'
+  );
+  const [isAuthInitializing, setIsAuthInitializing] = useState<boolean>(true);
+  const [manualAccountScreen, setManualAccountScreen] = useState<boolean>(false);
+
+  // Track cleared/deleted timestamps per conversation so old messages never reappear
+  const [clearedChatsMap, setClearedChatsMap] = useState<Record<string, number>>(() => {
+    try {
+      const raw = localStorage.getItem('sahpy_cleared_chats_v1');
+      if (raw) return JSON.parse(raw);
+    } catch {
+      // ignore
+    }
+    return {};
+  });
+  const [deletedContactIds, setDeletedContactIds] = useState<Record<string, number>>(() => {
+    try {
+      const raw = localStorage.getItem('sahpy_deleted_contacts_v1');
+      if (raw) return JSON.parse(raw);
+    } catch {
+      // ignore
+    }
+    return {};
+  });
+
+  // Clear / Delete Chat Confirmation Modal State
+  const [chatActionModal, setChatActionModal] = useState<{
+    isOpen: boolean;
+    contact: Contact | null;
+    initialAction: 'clear' | 'delete';
+  }>({
+    isOpen: false,
+    contact: null,
+    initialAction: 'clear',
+  });
+  const [isClearingOrDeletingChat, setIsClearingOrDeletingChat] = useState(false);
+
+  // Deduplication & anti-double-send locks
+  const sendingLockRef = useRef<boolean>(false);
+  const inFlightSendKeysRef = useRef<Set<string>>(new Set());
+  const processedMessageIdsRef = useRef<Set<string>>(new Set());
 
   // Contacts & Active Conversation State (Starts clean & empty like real WhatsApp!)
   const [contacts, setContacts] = useState<Contact[]>(() => {
@@ -328,6 +390,15 @@ export default function App() {
               ...c,
               name: String(c.name || '').replace(/الديزينر انجينير\s*/g, '').trim() || c.name,
               roleOrBio: String(c.roleOrBio || '').replace(/الديزينر انجينير\s*/g, '').replace(/نبض شات/g, 'SAHPY-CHAT'),
+              messages: Array.isArray(c.messages)
+                ? c.messages
+                    .filter((m: Message) => m && !String(m.id || '').startsWith('room-last-'))
+                    .map((m: Message) =>
+                      m.type === 'voice'
+                        ? { ...m, voiceDuration: formatSafeVoiceDuration(m.voiceDuration) }
+                        : m
+                    )
+                : [],
             }));
         }
       }
@@ -504,49 +575,76 @@ export default function App() {
     }
   }, [wallpaperConfig]);
 
-  // Helper to merge registered users into the local contacts list
+  // Persist clearedChatsMap & deletedContactIds
+  useEffect(() => {
+    try {
+      localStorage.setItem('sahpy_cleared_chats_v1', JSON.stringify(clearedChatsMap));
+    } catch {
+      // ignore
+    }
+  }, [clearedChatsMap]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('sahpy_deleted_contacts_v1', JSON.stringify(deletedContactIds));
+    } catch {
+      // ignore
+    }
+  }, [deletedContactIds]);
+
+  // Helper to merge registered users into the local contacts list (updates avatars & names in real time)
   const mergeUsersIntoContacts = useCallback(
-    (usersList: RegisteredDirectoryUser[], myPhone: string) => {
+    (usersList: RegisteredDirectoryUser[], myPhone: string, myUidParam?: string) => {
       const myNorm = normalizeDigits(myPhone);
+      const effectiveMyUid = myUidParam || currentUserUid || auth.currentUser?.uid || '';
       setContacts((prev) => {
         const updated = [...prev];
         let changed = false;
 
         usersList.forEach((u) => {
-          if (!u || !u.phone) return;
+          if (!u) return;
+          const uUid = u.uid || u.id || '';
           const uNorm = u.normalizedPhone || normalizeDigits(u.phone);
-          if (!uNorm) return;
-          if (myNorm && uNorm === myNorm) return;
+          const uUser = normalizeUsername(u.username);
+          if (effectiveMyUid && uUid === effectiveMyUid) return;
+          if (myNorm && uNorm && uNorm === myNorm) return;
 
           const existingIdx = updated.findIndex((c) => {
             if (c.isGroup) return false;
             const cNorm = normalizeDigits(c.phone);
             const cUser = normalizeUsername(c.username);
-            const uUser = normalizeUsername(u.username);
             return (
+              (uUid && (c.uid === uUid || c.id === uUid)) ||
+              (cUser.length >= 3 && uUser.length >= 3 && cUser === uUser) ||
               (cNorm.length >= 7 &&
+                uNorm.length >= 7 &&
                 (cNorm === uNorm ||
                   cNorm.endsWith(uNorm.slice(-9)) ||
-                  uNorm.endsWith(cNorm.slice(-9)))) ||
-              (cUser.length >= 3 && uUser.length >= 3 && cUser === uUser)
+                  uNorm.endsWith(cNorm.slice(-9))))
             );
           });
 
           // Privacy like WhatsApp: NEVER auto-add registered strangers into contacts!
-          // Only update metadata (username/avatar) if the contact is ALREADY in the user's chats.
+          // Only update metadata (username/avatar/name) if the contact is ALREADY in the user's chats.
           if (existingIdx !== -1) {
-            if (u.username && !updated[existingIdx].username) {
+            const currentContact = updated[existingIdx];
+            const resolvedAvatar = u.avatar
+              ? normalizeUserAvatarUrl(u.avatar, uUid || currentContact.id, u.name || currentContact.name)
+              : currentContact.avatar;
+            const nextName = u.name && u.name.trim() ? u.name.trim() : currentContact.name;
+            const nextUsername = u.username || currentContact.username;
+
+            if (
+              currentContact.avatar !== resolvedAvatar ||
+              currentContact.name !== nextName ||
+              currentContact.username !== nextUsername
+            ) {
               changed = true;
               updated[existingIdx] = {
-                ...updated[existingIdx],
-                username: u.username,
-              };
-            }
-            if (u.avatar && updated[existingIdx].avatar !== u.avatar) {
-              changed = true;
-              updated[existingIdx] = {
-                ...updated[existingIdx],
-                avatar: u.avatar,
+                ...currentContact,
+                name: nextName,
+                username: nextUsername,
+                avatar: resolvedAvatar,
               };
             }
           }
@@ -555,10 +653,10 @@ export default function App() {
         return changed ? updated : prev;
       });
     },
-    []
+    [currentUserUid]
   );
 
-  // Helper to append an incoming or synced message (1-on-1 or Group Chat)
+  // Helper to append an incoming or synced message (1-on-1 or Group Chat) without duplicates or phantom messages
   const appendMessageToContact = useCallback(
     (
       msg: {
@@ -570,6 +668,7 @@ export default function App() {
         groupId?: string;
         text: string;
         timestamp: string;
+        createdAt?: number;
         type: 'text' | 'voice' | 'image' | 'sticker';
         voiceDuration?: string;
         imageUrl?: string;
@@ -582,11 +681,33 @@ export default function App() {
       },
       myPhone: string
     ) => {
+      if (!msg || !msg.id) return;
+      if (String(msg.id).startsWith('room-last-')) return;
+
+      const msgCreatedAt = typeof msg.createdAt === 'number' ? msg.createdAt : 0;
+      const safeVoiceDuration =
+        msg.type === 'voice' ? formatSafeVoiceDuration(msg.voiceDuration) : undefined;
+
+      // Reject empty phantom messages that have no content, no media, and no sticker
+      if (
+        msg.type === 'text' &&
+        (!msg.text || !msg.text.trim()) &&
+        !msg.imageUrl &&
+        !msg.stickerEmoji
+      ) {
+        return;
+      }
+
       const myNorm = normalizeDigits(myPhone);
       const sNorm = normalizeDigits(msg.senderPhone);
       const rNorm = normalizeDigits(msg.recipientPhone);
 
       if (msg.groupId) {
+        const groupClearedAt = clearedChatsMap[msg.groupId] || 0;
+        if (groupClearedAt && msgCreatedAt && msgCreatedAt <= groupClearedAt) {
+          return;
+        }
+
         const isFromMe = Boolean(
           myNorm &&
             (sNorm === myNorm ||
@@ -596,6 +717,8 @@ export default function App() {
         setContacts((prev) =>
           prev.map((c) => {
             if (c.id !== msg.groupId) return c;
+            const cCleared = c.clearedAtMs || clearedChatsMap[c.id] || 0;
+            if (cCleared && msgCreatedAt && msgCreatedAt <= cCleared) return c;
             if (c.messages.some((m) => m.id === msg.id)) return c;
             const newMsg: Message = {
               id: msg.id,
@@ -605,9 +728,10 @@ export default function App() {
               senderAvatar: msg.senderAvatar,
               text: msg.text,
               timestamp: msg.timestamp,
+              createdAtMs: msgCreatedAt || Date.now(),
               status: 'read',
               type: msg.type || 'text',
-              voiceDuration: msg.voiceDuration,
+              voiceDuration: safeVoiceDuration,
               imageUrl: msg.imageUrl,
               imageCaption: msg.imageCaption,
               stickerId: msg.stickerId,
@@ -627,15 +751,17 @@ export default function App() {
         return;
       }
 
+      if (!myNorm || myNorm.length < 7) return;
+
       const isFromMe = Boolean(
-        myNorm &&
+        sNorm &&
           (sNorm === myNorm ||
             (sNorm.length >= 9 &&
               myNorm.length >= 9 &&
               sNorm.slice(-9) === myNorm.slice(-9)))
       );
       const isToMe = Boolean(
-        myNorm &&
+        rNorm &&
           (rNorm === myNorm ||
             (rNorm.length >= 9 &&
               myNorm.length >= 9 &&
@@ -649,7 +775,9 @@ export default function App() {
         ? msg.recipientPhone
         : msg.senderName || msg.senderPhone;
 
-      if (!otherNorm) return;
+      if (!otherNorm || otherNorm.length < 7) return;
+      // Prevent self-loop if sender and recipient phone are identical
+      if (sNorm === rNorm) return;
 
       setContacts((prev) => {
         const idx = prev.findIndex((c) => {
@@ -671,9 +799,10 @@ export default function App() {
           senderAvatar: msg.senderAvatar,
           text: msg.text,
           timestamp: msg.timestamp,
+          createdAtMs: msgCreatedAt || Date.now(),
           status: 'read',
           type: msg.type || 'text',
-          voiceDuration: msg.voiceDuration,
+          voiceDuration: safeVoiceDuration,
           imageUrl: msg.imageUrl,
           imageCaption: msg.imageCaption,
           stickerId: msg.stickerId,
@@ -686,23 +815,44 @@ export default function App() {
 
         if (idx !== -1) {
           const target = prev[idx];
+          const cCleared =
+            target.clearedAtMs ||
+            clearedChatsMap[target.id] ||
+            (target.uid ? clearedChatsMap[target.uid] : 0) ||
+            (target.chatId ? clearedChatsMap[target.chatId] : 0) ||
+            0;
+          if (cCleared && (!msgCreatedAt || msgCreatedAt <= cCleared)) {
+            return prev;
+          }
           if (target.messages.some((m) => m.id === msg.id)) return prev;
           const next = [...prev];
           next[idx] = {
             ...target,
             name: !isFromMe && msg.senderName ? msg.senderName : target.name,
-            avatar: !isFromMe && msg.senderAvatar ? msg.senderAvatar : target.avatar,
+            avatar:
+              !isFromMe && msg.senderAvatar
+                ? normalizeUserAvatarUrl(msg.senderAvatar, target.uid || target.id, msg.senderName || target.name)
+                : target.avatar,
             unreadCount: isFromMe ? target.unreadCount : target.unreadCount + 1,
             messages: [...target.messages, formattedMsg],
           };
           return next;
         } else {
+          const contactKey = `contact-${otherNorm}`;
+          const deletedAt = deletedContactIds[contactKey] || clearedChatsMap[contactKey] || 0;
+          if (deletedAt && (!msgCreatedAt || msgCreatedAt <= deletedAt)) {
+            return prev;
+          }
           const newContact: Contact = {
-            id: `contact-${otherNorm}`,
+            id: contactKey,
             name: otherName,
             phone: otherRawPhone,
             username: normalizeUsername(otherName),
-            avatar: (!isFromMe && msg.senderAvatar) ? msg.senderAvatar : omarAvatar,
+            avatar: normalizeUserAvatarUrl(
+              !isFromMe ? msg.senderAvatar : undefined,
+              contactKey,
+              otherName
+            ),
             roleOrBio: 'مستخدم مسجل في SAHPY-CHAT ✨',
             isOnline: true,
             lastSeen: 'متصل الآن',
@@ -718,35 +868,135 @@ export default function App() {
         }
       });
     },
-    []
+    [clearedChatsMap, deletedContactIds]
   );
 
-  // Sync with Firebase Authentication Session & Cloud Firestore
+  // Sync with Firebase Authentication Session & Cloud Firestore (Persists across page refresh!)
   useEffect(() => {
     const unsubAuth = subscribeToAuthChanges(async (fbUser) => {
       if (fbUser && fbUser.emailVerified) {
         setCurrentUserUid(fbUser.uid);
         localStorage.setItem('nabd_user_uid', fbUser.uid);
+        if (!manualAccountScreen) {
+          setViewMode('chat');
+        }
         try {
           const profile = await fetchUserProfileByUid(fbUser.uid);
           if (profile) {
-            setUserName(profile.displayName || fbUser.displayName || userName);
-            setUserPhone(profile.phoneTag || '');
-            if (profile.username) setUserUsername(profile.username);
-            if (profile.bio) setUserBio(profile.bio);
+            const resolvedName = profile.displayName || fbUser.displayName || userName;
+            const resolvedPhone = profile.phoneTag || '';
+            const resolvedUsername = profile.username || userUsername;
+            const resolvedBio = profile.bio || userBio;
+            const resolvedAvatar = normalizeUserAvatarUrl(
+              profile.avatarUrl || fbUser.photoURL || localStorage.getItem('nabd_user_avatar') || undefined,
+              fbUser.uid,
+              resolvedName
+            );
+
+            setUserName(resolvedName);
+            setUserPhone(resolvedPhone);
+            if (resolvedUsername) setUserUsername(resolvedUsername);
+            if (resolvedBio) setUserBio(resolvedBio);
+            setUserAvatar(resolvedAvatar);
+
+            localStorage.setItem('nabd_user_name', resolvedName);
+            localStorage.setItem('nabd_user_phone', resolvedPhone);
+            if (resolvedUsername) localStorage.setItem('nabd_user_username', resolvedUsername);
+            if (resolvedBio) localStorage.setItem('nabd_user_bio', resolvedBio);
+            localStorage.setItem('nabd_user_avatar', resolvedAvatar);
             setFirestoreConnected(true);
           }
         } catch {
-          // Error is logged by handleFirestoreError
+          // Handled gracefully
+        } finally {
+          setIsAuthInitializing(false);
         }
       } else {
         setCurrentUserUid('');
         localStorage.removeItem('nabd_user_uid');
         setViewMode('registration');
+        setIsAuthInitializing(false);
       }
     });
     return () => unsubAuth();
-  }, [userName]);
+  }, [manualAccountScreen]);
+
+  // Subscribe to user's saved contacts in Firestore (/users/{uid}/contacts)
+  useEffect(() => {
+    const myUid = currentUserUid || auth.currentUser?.uid || '';
+    if (!myUid || !auth.currentUser?.emailVerified) return;
+
+    const unsubSaved = subscribeToSavedContacts(myUid, (savedList) => {
+      setFirestoreConnected(true);
+      if (savedList.length === 0) return;
+      setContacts((prev) => {
+        const next = [...prev];
+        let changed = false;
+
+        savedList.forEach((sc) => {
+          if (!sc.id || sc.id === myUid) return;
+          const deletedAt = deletedContactIds[sc.id] || 0;
+          if (deletedAt) return;
+
+          const existingIdx = next.findIndex(
+            (c) => c.id === sc.id || c.uid === sc.id
+          );
+          const resolvedAvatar = normalizeUserAvatarUrl(
+            sc.avatar,
+            sc.id,
+            sc.name
+          );
+
+          if (existingIdx !== -1) {
+            const curr = next[existingIdx];
+            const nextCleared = Math.max(curr.clearedAtMs || 0, sc.clearedAtMs || 0);
+            if (
+              (sc.avatar && curr.avatar !== resolvedAvatar) ||
+              (sc.username && curr.username !== sc.username) ||
+              (nextCleared && curr.clearedAtMs !== nextCleared)
+            ) {
+              changed = true;
+              next[existingIdx] = {
+                ...curr,
+                username: sc.username || curr.username,
+                avatar: sc.avatar ? resolvedAvatar : curr.avatar,
+                clearedAtMs: nextCleared || undefined,
+                messages: nextCleared
+                  ? curr.messages.filter((m) => !m.createdAtMs || m.createdAtMs > nextCleared)
+                  : curr.messages,
+              };
+            }
+          } else {
+            changed = true;
+            next.push({
+              id: sc.id,
+              uid: sc.id,
+              chatId: getDeterministicChatId(myUid, sc.id),
+              name: sc.name,
+              phone: sc.phone || (sc.username ? `@${sc.username}` : sc.id),
+              username: sc.username,
+              avatar: resolvedAvatar,
+              roleOrBio: sc.bio || 'مستخدم مسجل في SAHPY-CHAT ✨',
+              isOnline: true,
+              lastSeen: 'متصل الآن',
+              unreadCount: 0,
+              isPinned: sc.isPinned,
+              isMuted: sc.isMuted,
+              isBlocked: sc.isBlocked,
+              clearedAtMs: sc.clearedAtMs,
+              customWallpaper: 'aurora-borealis',
+              sharedMedia: [],
+              messages: [],
+            });
+          }
+        });
+
+        return changed ? next : prev;
+      });
+    });
+
+    return () => unsubSaved();
+  }, [currentUserUid, deletedContactIds]);
 
   // Search Firestore when typing in sidebar search box
   useEffect(() => {
@@ -778,18 +1028,6 @@ export default function App() {
       return;
     }
 
-    if (viewMode === 'chat') {
-      syncUserToFirestore({
-        name: userName,
-        phone: userPhone,
-        username: userUsername,
-        bio: userBio,
-        avatar: userAvatar,
-      }).then(() => {
-        setFirestoreConnected(true);
-      });
-    }
-
     const unsubUsers = subscribeToFirestoreUsers((cloudUsers) => {
       setFirestoreConnected(true);
       setRegisteredUsers((prev) => {
@@ -797,24 +1035,26 @@ export default function App() {
         cloudUsers.forEach((cu) => {
           const exists = merged.some(
             (u) =>
+              (u.uid && cu.id && u.uid === cu.id) ||
               normalizeDigits(u.phone) ===
-              (cu.normalizedPhone || normalizeDigits(cu.phone))
+                (cu.normalizedPhone || normalizeDigits(cu.phone))
           );
           if (!exists) {
             merged.push({
               id: cu.id,
+              uid: cu.id,
               name: cu.name,
               phone: cu.phone,
               normalizedPhone: cu.normalizedPhone,
               username: normalizeUsername(cu.name),
               bio: cu.bio,
-              avatar: cu.avatar,
+              avatar: normalizeUserAvatarUrl(cu.avatar, cu.id, cu.name),
               isOnline: cu.isOnline,
               lastSeen: cu.lastSeen,
             });
           }
         });
-        mergeUsersIntoContacts(merged, userPhone);
+        mergeUsersIntoContacts(merged, userPhone, currentUserUid);
         return merged;
       });
     });
@@ -831,11 +1071,7 @@ export default function App() {
     };
   }, [
     currentUserUid,
-    viewMode,
-    userName,
     userPhone,
-    userUsername,
-    userBio,
     mergeUsersIntoContacts,
     appendMessageToContact,
   ]);
@@ -847,7 +1083,7 @@ export default function App() {
       .then((data) => {
         if (data && Array.isArray(data.users)) {
           setRegisteredUsers(data.users);
-          mergeUsersIntoContacts(data.users, userPhone);
+          mergeUsersIntoContacts(data.users, userPhone, currentUserUid);
         }
       })
       .catch(() => {});
@@ -892,7 +1128,7 @@ export default function App() {
         if (data.type === 'init') {
           if (Array.isArray(data.users)) {
             setRegisteredUsers(data.users);
-            mergeUsersIntoContacts(data.users, userPhone);
+            mergeUsersIntoContacts(data.users, userPhone, currentUserUid);
           }
           if (Array.isArray(data.stories) && data.stories.length > 0) {
             setStories((prev) => {
@@ -910,12 +1146,12 @@ export default function App() {
             setContacts((prev) => {
               const next = [...prev];
               data.groups.forEach((g: any) => {
-                if (!next.some((c) => c.id === g.id)) {
+                if (!next.some((c) => c.id === g.id) && !deletedContactIds[g.id]) {
                   next.unshift({
                     id: g.id,
                     name: g.name,
                     phone: `مجموعة • ${g.members?.length || 1} أعضاء`,
-                    avatar: g.avatar || omarAvatar,
+                    avatar: normalizeUserAvatarUrl(g.avatar, g.id, g.name),
                     roleOrBio: g.description || 'مجموعة دردشة على SAHPY-CHAT ✨',
                     isOnline: true,
                     lastSeen: `${g.members?.length || 1} أعضاء`,
@@ -940,7 +1176,53 @@ export default function App() {
           }
         } else if (data.type === 'users:update' && Array.isArray(data.users)) {
           setRegisteredUsers(data.users);
-          mergeUsersIntoContacts(data.users, userPhone);
+          mergeUsersIntoContacts(data.users, userPhone, currentUserUid);
+        } else if (data.type === 'user:update' && data.user) {
+          const u = data.user as RegisteredDirectoryUser;
+          setRegisteredUsers((prev) => {
+            const idx = prev.findIndex(
+              (item) =>
+                (u.uid && item.uid === u.uid) ||
+                item.id === u.id ||
+                (u.username && normalizeUsername(item.username) === normalizeUsername(u.username))
+            );
+            const next = idx === -1 ? [u, ...prev] : prev.map((item, i) => (i === idx ? { ...item, ...u } : item));
+            mergeUsersIntoContacts(next, userPhone, currentUserUid);
+            return next;
+          });
+          // Also update stories avatar if this user has active stories
+          if (u.avatar) {
+            setStories((prev) =>
+              prev.map((s) =>
+                (u.username && normalizeUsername(s.userUsername) === normalizeUsername(u.username)) ||
+                (u.phone && normalizeDigits(s.userPhone) === normalizeDigits(u.phone))
+                  ? { ...s, avatar: u.avatar }
+                  : s
+              )
+            );
+          }
+        } else if (data.type === 'chat:clear') {
+          const clearedGroupId = data.groupId;
+          const pA = normalizeDigits(data.participantPhoneA);
+          const pB = normalizeDigits(data.participantPhoneB);
+          const myNorm = normalizeDigits(userPhone);
+          if (clearedGroupId) {
+            setContacts((prev) =>
+              prev.map((c) => (c.id === clearedGroupId ? { ...c, messages: [], unreadCount: 0 } : c))
+            );
+          } else if (myNorm && (pA === myNorm || pB === myNorm)) {
+            const otherNorm = pA === myNorm ? pB : pA;
+            setContacts((prev) =>
+              prev.map((c) => {
+                if (c.isGroup) return c;
+                const cNorm = normalizeDigits(c.phone);
+                if (cNorm && otherNorm && (cNorm === otherNorm || cNorm.endsWith(otherNorm.slice(-9)))) {
+                  return { ...c, messages: [], unreadCount: 0, clearedAtMs: Date.now() };
+                }
+                return c;
+              })
+            );
+          }
         } else if (data.type === 'story:new' && data.story) {
           setStories((prev) => {
             if (prev.some((s) => s.id === data.story.id)) return prev;
@@ -956,7 +1238,7 @@ export default function App() {
               id: g.id,
               name: g.name,
               phone: `مجموعة • ${g.members?.length || 1} أعضاء`,
-              avatar: g.avatar || omarAvatar,
+              avatar: normalizeUserAvatarUrl(g.avatar, g.id, g.name),
               roleOrBio: g.description || 'مجموعة دردشة على SAHPY-CHAT ✨',
               isOnline: true,
               lastSeen: `${g.members?.length || 1} أعضاء`,
@@ -996,7 +1278,7 @@ export default function App() {
       setWsConnected(false);
     };
 
-    // Real-time background sync every 3.5s for mobile/multi-device reliability
+    // Real-time background sync every 4s for user directory & group/fallback messages
     const syncInterval = setInterval(() => {
       if (userPhone) {
         fetch(`/api/messages?phone=${encodeURIComponent(userPhone)}`)
@@ -1015,17 +1297,17 @@ export default function App() {
         .then((data) => {
           if (data && Array.isArray(data.users)) {
             setRegisteredUsers(data.users);
-            mergeUsersIntoContacts(data.users, userPhone);
+            mergeUsersIntoContacts(data.users, userPhone, currentUserUid);
           }
         })
         .catch(() => {});
-    }, 3500);
+    }, 4000);
 
     return () => {
       clearInterval(syncInterval);
       ws.close();
     };
-  }, [userPhone, userName, mergeUsersIntoContacts, appendMessageToContact]);
+  }, [userPhone, userName, currentUserUid, deletedContactIds, mergeUsersIntoContacts, appendMessageToContact]);
 
   // Selected Contact
   const selectedContact =
@@ -1046,41 +1328,114 @@ export default function App() {
       setContacts((prev) =>
         prev.map((c) => {
           if (c.id !== selectedContact.id && c.uid !== targetUid) return c;
-          const existingIds = new Set(c.messages.map((m) => m.id));
-          const additions: Message[] = [];
+          const cClearedAt =
+            c.clearedAtMs ||
+            clearedChatsMap[c.id] ||
+            clearedChatsMap[targetUid] ||
+            clearedChatsMap[chatId] ||
+            0;
+
+          // Filter out any synthetic room-last messages and any messages cleared by the user
+          const baseMessages = c.messages.filter(
+            (m) =>
+              !String(m.id).startsWith('room-last-') &&
+              (!cClearedAt || !m.createdAtMs || m.createdAtMs > cClearedAt)
+          );
+
+          // If cloudMsgs is empty (e.g., cleared for both sides in Firestore), reflect that if all current messages were already synced
+          if (cloudMsgs.length === 0 && baseMessages.length > 0 && baseMessages.every((m) => m.status === 'read')) {
+            return {
+              ...c,
+              chatId,
+              messages: [],
+              unreadCount: 0,
+            };
+          }
+
+          const existingById = new Map<string, Message>();
+          baseMessages.forEach((m) => existingById.set(m.id, m));
+
+          let changed = baseMessages.length !== c.messages.length;
+
           cloudMsgs.forEach((cm) => {
-            if (!existingIds.has(cm.id)) {
-              const isFromMe = cm.senderUid === myUid;
-              additions.push({
-                id: cm.id,
-                senderId: isFromMe ? 'me' : c.id,
-                senderUid: cm.senderUid,
-                senderName: cm.senderName,
-                text: cm.text,
-                timestamp: new Date(cm.createdAt).toLocaleTimeString('ar-EG', {
+            if (!cm || !cm.id) return;
+            if (cClearedAt && cm.createdAt <= cClearedAt) return;
+
+            const isFromMe = cm.senderUid === myUid;
+            const safeVoiceDur =
+              cm.type === 'voice'
+                ? formatSafeVoiceDuration(cm.voiceDuration)
+                : undefined;
+
+            const formatted: Message = {
+              id: cm.id,
+              senderId: isFromMe ? 'me' : c.id,
+              senderUid: cm.senderUid,
+              senderName: cm.senderName,
+              senderAvatar: cm.senderAvatar,
+              text: cm.type === 'voice' || cm.type === 'image' ? '' : cm.text,
+              timestamp:
+                cm.displayTime ||
+                new Date(cm.createdAt).toLocaleTimeString('ar-EG', {
                   hour: '2-digit',
                   minute: '2-digit',
                 }),
-                status: 'read',
-                type: cm.type || 'text',
-                reactions: [],
-              });
+              createdAtMs: cm.createdAt,
+              status: 'read',
+              type: cm.type || 'text',
+              voiceDuration: safeVoiceDur,
+              imageUrl: cm.imageUrl,
+              imageCaption: cm.imageCaption || (cm.type === 'image' ? cm.text : undefined),
+              stickerId: cm.stickerId,
+              stickerEmoji: cm.stickerEmoji,
+              stickerLabel: cm.stickerLabel || (cm.type === 'sticker' ? cm.text : undefined),
+              stickerGradient: cm.stickerGradient,
+              stickerPackId: cm.stickerPackId,
+              reactions: existingById.get(cm.id)?.reactions || [],
+              isStarred: existingById.get(cm.id)?.isStarred,
+              replyTo: existingById.get(cm.id)?.replyTo,
+            };
+
+            const prevMsg = existingById.get(cm.id);
+            if (!prevMsg) {
+              changed = true;
+              existingById.set(cm.id, formatted);
+            } else if (
+              prevMsg.type === 'voice' &&
+              (!prevMsg.voiceDuration || prevMsg.voiceDuration === 'undefined')
+            ) {
+              changed = true;
+              existingById.set(cm.id, { ...prevMsg, voiceDuration: safeVoiceDur });
             }
           });
-          if (additions.length === 0) return c;
+
+          if (!changed) return c;
+
+          const mergedMessages = Array.from(existingById.values()).sort(
+            (a, b) => (a.createdAtMs || 0) - (b.createdAtMs || 0)
+          );
+
           return {
             ...c,
             chatId,
-            messages: [...c.messages, ...additions],
+            messages: mergedMessages,
           };
         })
       );
     });
 
     return () => unsub();
-  }, [currentUserUid, selectedContact?.id, selectedContact?.uid, selectedContact?.chatId, selectedContact?.isGroup]);
+  }, [
+    currentUserUid,
+    selectedContact?.id,
+    selectedContact?.uid,
+    selectedContact?.chatId,
+    selectedContact?.isGroup,
+    clearedChatsMap,
+  ]);
 
   // Subscribe to all authorized Firestore 1-on-1 chat rooms where current user is a participant
+  // (Syncs contact metadata & live avatar updates WITHOUT creating duplicate/phantom messages!)
   useEffect(() => {
     const myUid = currentUserUid || auth.currentUser?.uid || '';
     if (!myUid || !auth.currentUser?.emailVerified) return;
@@ -1093,6 +1448,18 @@ export default function App() {
         let changed = false;
         for (const room of rooms) {
           if (!room.otherUid || room.otherUid === myUid) continue;
+          const deletedAt =
+            deletedContactIds[room.otherUid] || deletedContactIds[room.chatId] || 0;
+          if (deletedAt && (!room.updatedAt || room.updatedAt <= deletedAt)) {
+            continue;
+          }
+
+          const resolvedAvatar = normalizeUserAvatarUrl(
+            room.otherAvatar,
+            room.otherUid,
+            room.otherName || room.otherUsername
+          );
+
           const existingIdx = next.findIndex(
             (c) => c.uid === room.otherUid || c.id === room.otherUid
           );
@@ -1107,7 +1474,7 @@ export default function App() {
                 (room.otherUsername ? `@${room.otherUsername}` : 'مستخدم مسجل'),
               phone: room.otherUsername ? `@${room.otherUsername}` : room.otherUid,
               username: room.otherUsername || undefined,
-              avatar: omarAvatar,
+              avatar: resolvedAvatar,
               roleOrBio: 'مستخدم مسجل وموثّق في SAHPY-CHAT ✨',
               isOnline: true,
               lastSeen: 'متصل الآن',
@@ -1117,22 +1484,32 @@ export default function App() {
               isBlocked: false,
               customWallpaper: 'aurora-borealis',
               sharedMedia: [],
-              messages: room.lastMessageText
-                ? [
-                    {
-                      id: `room-last-${room.chatId}`,
-                      senderId: room.otherUid,
-                      senderUid: room.otherUid,
-                      senderName: room.otherName,
-                      text: room.lastMessageText,
-                      timestamp: room.lastMessageTime || 'الآن',
-                      status: 'read',
-                      type: 'text',
-                      reactions: [],
-                    },
-                  ]
-                : [],
+              messages: [],
             });
+          } else {
+            const curr = next[existingIdx];
+            const nextName =
+              room.otherName && room.otherName.trim()
+                ? room.otherName.trim()
+                : curr.name;
+            const nextUser = room.otherUsername || curr.username;
+            const nextAvatar = room.otherAvatar ? resolvedAvatar : curr.avatar;
+
+            if (
+              curr.name !== nextName ||
+              curr.username !== nextUser ||
+              curr.avatar !== nextAvatar ||
+              curr.chatId !== room.chatId
+            ) {
+              changed = true;
+              next[existingIdx] = {
+                ...curr,
+                chatId: room.chatId,
+                name: nextName,
+                username: nextUser,
+                avatar: nextAvatar,
+              };
+            }
           }
         }
         return changed ? next : prev;
@@ -1140,7 +1517,7 @@ export default function App() {
     });
 
     return () => unsubRooms();
-  }, [currentUserUid]);
+  }, [currentUserUid, deletedContactIds]);
 
   // Reset groupSenderMemberId when switching contacts
   useEffect(() => {
@@ -1250,12 +1627,14 @@ export default function App() {
           id: sidebarFirestoreMatch.uid,
           uid: sidebarFirestoreMatch.uid,
           name: sidebarFirestoreMatch.displayName,
-          phone: sidebarFirestoreMatch.phoneVerified
-            ? 'مؤكد عبر OTP'
-            : 'مسجل في Firestore',
+          phone: `@${sidebarFirestoreMatch.username}`,
           username: sidebarFirestoreMatch.username,
           bio: sidebarFirestoreMatch.bio || 'مستخدم موثق في SAHPY-CHAT ✨',
-          avatar: omarAvatar,
+          avatar: normalizeUserAvatarUrl(
+            sidebarFirestoreMatch.avatarUrl,
+            sidebarFirestoreMatch.uid,
+            sidebarFirestoreMatch.displayName
+          ),
           emailVerified: sidebarFirestoreMatch.emailVerified,
           phoneVerified: sidebarFirestoreMatch.phoneVerified,
           isOnline: true,
@@ -1288,7 +1667,10 @@ export default function App() {
       const matchesUser = qUser.length >= 2 && uUser.includes(qUser);
       const matchesName = (u.name || '').toLowerCase().includes(qLower);
       if (matchesUid || matchesPhone || matchesUser || matchesName) {
-        results.push(u);
+        results.push({
+          ...u,
+          avatar: normalizeUserAvatarUrl(u.avatar, uUid, u.name),
+        });
       }
     });
 
@@ -1320,8 +1702,12 @@ export default function App() {
     stayOnScreen?: boolean;
   }) => {
     const cleanUser = normalizeUsername(username) || 'salah_gomaa';
-    const finalAvatar = avatar || userAvatar || ahmedAvatar;
     const effectiveUid = uid || auth.currentUser?.uid || currentUserUid || '';
+    const finalAvatar = normalizeUserAvatarUrl(
+      avatar || userAvatar,
+      effectiveUid || cleanUser,
+      name
+    );
     if (effectiveUid) {
       setCurrentUserUid(effectiveUid);
       localStorage.setItem('nabd_user_uid', effectiveUid);
@@ -1376,7 +1762,7 @@ export default function App() {
 
     if (Array.isArray(data.users)) {
       setRegisteredUsers(data.users);
-      mergeUsersIntoContacts(data.users, phone);
+      mergeUsersIntoContacts(data.users, phone, effectiveUid);
     } else if (effectiveUid) {
       const fallbackEntry: RegisteredDirectoryUser = {
         id: effectiveUid,
@@ -1415,6 +1801,7 @@ export default function App() {
     }
 
     if (!stayOnScreen) {
+      setManualAccountScreen(false);
       setViewMode('chat');
       triggerToast(
         `مرحباً ${name}! تم تسجيل الدخول بنجاح (@${cleanUser}) في SAHPY-CHAT ✅`
@@ -1424,6 +1811,7 @@ export default function App() {
 
   // Real Logout Handler
   const handleRealLogout = async () => {
+    setManualAccountScreen(false);
     await logoutFromFirebase();
     setCurrentUserUid('');
     localStorage.removeItem('nabd_user_uid');
@@ -1468,12 +1856,31 @@ export default function App() {
         ? getDeterministicChatId(myUid, targetUid)
         : undefined;
 
+    const resolvedTargetAvatar = normalizeUserAvatarUrl(
+      user.avatar,
+      targetUid,
+      user.name
+    );
+
+    // Clear any deleted contact marker if the user explicitly starts a chat again
+    setDeletedContactIds((prev) => {
+      if (!prev[targetUid] && (!chatId || !prev[chatId])) return prev;
+      const next = { ...prev };
+      delete next[targetUid];
+      if (chatId) delete next[chatId];
+      return next;
+    });
+
     if (myUid && targetUid && myUid !== targetUid) {
       ensureAuthorizedChatRoomInFirestore({
         myUid,
         otherUid: targetUid,
+        myName: userName,
+        otherName: user.name,
         myUsername: userUsername,
         otherUsername: user.username || normalizeUsername(user.name),
+        myAvatar: userAvatar,
+        otherAvatar: resolvedTargetAvatar,
       }).catch(() => {});
     }
 
@@ -1488,7 +1895,7 @@ export default function App() {
         name: user.name,
         phone: user.phone,
         username: user.username || normalizeUsername(user.name),
-        avatar: user.avatar || omarAvatar,
+        avatar: resolvedTargetAvatar,
         roleOrBio: user.bio || 'مستخدم مسجل وموثق في SAHPY-CHAT ✨',
         isOnline: true,
         lastSeen: 'متصل الآن',
@@ -1504,6 +1911,7 @@ export default function App() {
       syncContactToFirestore(newContact);
       setSelectedContactId(newId);
     }
+    setManualAccountScreen(false);
     setViewMode('chat');
     setMobileShowChat(true);
   };
@@ -1546,7 +1954,7 @@ export default function App() {
         name: m.name,
         phone: m.phone,
         username: m.username || normalizeUsername(m.name),
-        avatar: m.avatar || omarAvatar,
+        avatar: normalizeUserAvatarUrl(m.avatar, m.id, m.name),
         role: 'member' as const,
         isOnline: m.isOnline ?? true,
       })),
@@ -1557,7 +1965,7 @@ export default function App() {
       name,
       phone: `مجموعة • ${fullMembers.length} أعضاء`,
       username: normalizeUsername(name),
-      avatar: members[0]?.avatar || omarAvatar,
+      avatar: normalizeUserAvatarUrl(members[0]?.avatar, groupId, name),
       roleOrBio: description,
       isOnline: true,
       lastSeen: `${fullMembers.length} أعضاء مشاركين`,
@@ -1582,6 +1990,7 @@ export default function App() {
             hour: '2-digit',
             minute: '2-digit',
           }),
+          createdAtMs: Date.now(),
           status: 'read',
           type: 'text',
           reactions: [{ emoji: '🎉', count: fullMembers.length, userReacted: true }],
@@ -1630,6 +2039,7 @@ export default function App() {
             hour: '2-digit',
             minute: '2-digit',
           }),
+          createdAtMs: Date.now(),
           status: 'read',
           type: 'text',
           reactions: [],
@@ -1683,10 +2093,11 @@ export default function App() {
     );
   };
 
-  // Send Text Message (Supports both 1-on-1 AND Group Chat! Requires verified sender)
+  // Send Text Message (Supports both 1-on-1 AND Group Chat! Prevents duplicate sends via unique ID + dedupe lock)
   const handleSendMessage = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-    if (!inputText.trim() || !selectedContact || selectedContact.isBlocked) return;
+    const trimmedText = inputText.trim();
+    if (!trimmedText || !selectedContact || selectedContact.isBlocked) return;
 
     const myUid = currentUserUid || auth.currentUser?.uid || '';
     if (!myUid || !auth.currentUser || !auth.currentUser.emailVerified) {
@@ -1695,7 +2106,17 @@ export default function App() {
       return;
     }
 
-    const nowTime = new Date().toLocaleTimeString('ar-EG', {
+    const dedupeKey = `txt:${selectedContact.id}:${trimmedText}`;
+    if (inFlightSendKeysRef.current.has(dedupeKey)) {
+      return;
+    }
+    inFlightSendKeysRef.current.add(dedupeKey);
+    setTimeout(() => {
+      inFlightSendKeysRef.current.delete(dedupeKey);
+    }, 800);
+
+    const nowMs = Date.now();
+    const nowTime = new Date(nowMs).toLocaleTimeString('ar-EG', {
       hour: '2-digit',
       minute: '2-digit',
     });
@@ -1711,15 +2132,17 @@ export default function App() {
     const effectiveSenderPhone = activeGroupMember ? activeGroupMember.phone : userPhone;
     const effectiveSenderAvatar = activeGroupMember ? activeGroupMember.avatar : userAvatar;
 
-    const newMsgId = `msg-${Date.now()}`;
+    const newMsgId = `msg_${nowMs}_${Math.random().toString(36).slice(2, 7)}`;
     const newMsg: Message = {
       id: newMsgId,
       senderId: effectiveSenderId,
+      senderUid: myUid,
       senderName: effectiveSenderName,
       senderPhone: effectiveSenderPhone,
       senderAvatar: effectiveSenderAvatar,
-      text: inputText.trim(),
+      text: trimmedText,
       timestamp: nowTime,
+      createdAtMs: nowMs,
       status: 'sent',
       type: 'text',
       reactions: [],
@@ -1741,9 +2164,11 @@ export default function App() {
     const targetPhone = selectedContact.phone;
 
     setContacts((prev) =>
-      prev.map((c) =>
-        c.id === targetId ? { ...c, messages: [...c.messages, newMsg] } : c
-      )
+      prev.map((c) => {
+        if (c.id !== targetId) return c;
+        if (c.messages.some((m) => m.id === newMsgId)) return c;
+        return { ...c, messages: [...c.messages, newMsg] };
+      })
     );
     setInputText('');
     setReplyingTo(null);
@@ -1765,32 +2190,38 @@ export default function App() {
       }),
     }).catch(() => {});
 
-    sendMessageToFirestore({
-      id: newMsgId,
-      senderPhone: effectiveSenderPhone,
-      senderName: effectiveSenderName,
-      recipientPhone: isGroupChat ? `group:${targetId}` : targetPhone,
-      text: newMsg.text,
-      timestamp: nowTime,
-      type: 'text',
-    });
-
     const recipientUid =
       selectedContact.uid ||
       (!isGroupChat && !DEMO_CONTACT_IDS.has(selectedContact.id)
         ? selectedContact.id
         : '');
 
+    sendMessageToFirestore({
+      id: newMsgId,
+      senderPhone: effectiveSenderPhone,
+      senderName: effectiveSenderName,
+      senderAvatar: effectiveSenderAvatar,
+      recipientPhone: isGroupChat ? `group:${targetId}` : targetPhone,
+      recipientUid: recipientUid || undefined,
+      senderUsername: userUsername,
+      text: newMsg.text,
+      timestamp: nowTime,
+      type: 'text',
+    });
+
     if (!isGroupChat && myUid && recipientUid && myUid !== recipientUid) {
       sendDirectMessageToAuthorizedChat({
+        id: newMsgId,
         senderUid: myUid,
         recipientUid,
         senderName: effectiveSenderName,
         senderUsername: userUsername,
+        senderAvatar: effectiveSenderAvatar,
         recipientName: selectedContact.name,
         recipientUsername: selectedContact.username,
         text: newMsg.text,
         type: 'text',
+        displayTime: nowTime,
       }).catch(() => {});
     }
 
@@ -1808,7 +2239,17 @@ export default function App() {
       return;
     }
 
-    const nowTime = new Date().toLocaleTimeString('ar-EG', {
+    const dedupeKey = `stk:${selectedContact.id}:${sticker.id}`;
+    if (inFlightSendKeysRef.current.has(dedupeKey)) {
+      return;
+    }
+    inFlightSendKeysRef.current.add(dedupeKey);
+    setTimeout(() => {
+      inFlightSendKeysRef.current.delete(dedupeKey);
+    }, 600);
+
+    const nowMs = Date.now();
+    const nowTime = new Date(nowMs).toLocaleTimeString('ar-EG', {
       hour: '2-digit',
       minute: '2-digit',
     });
@@ -1824,21 +2265,24 @@ export default function App() {
     const effectiveSenderPhone = activeGroupMember ? activeGroupMember.phone : userPhone;
     const effectiveSenderAvatar = activeGroupMember ? activeGroupMember.avatar : userAvatar;
 
-    const newMsgId = `stk-${Date.now()}`;
+    const newMsgId = `stk_${nowMs}_${Math.random().toString(36).slice(2, 7)}`;
     const stickerSummaryText = `${sticker.emoji} ${sticker.label}`;
+    const stickerEmojiCombined = `${sticker.emoji}${sticker.secondaryEmoji}`;
 
     const newMsg: Message = {
       id: newMsgId,
       senderId: effectiveSenderId,
+      senderUid: myUid,
       senderName: effectiveSenderName,
       senderPhone: effectiveSenderPhone,
       senderAvatar: effectiveSenderAvatar,
       text: stickerSummaryText,
       timestamp: nowTime,
+      createdAtMs: nowMs,
       status: 'sent',
       type: 'sticker',
       stickerId: sticker.id,
-      stickerEmoji: `${sticker.emoji}${sticker.secondaryEmoji}`,
+      stickerEmoji: stickerEmojiCombined,
       stickerLabel: sticker.label,
       stickerGradient: sticker.gradient,
       stickerPackId: sticker.packId,
@@ -1863,9 +2307,11 @@ export default function App() {
     const targetPhone = selectedContact.phone;
 
     setContacts((prev) =>
-      prev.map((c) =>
-        c.id === targetId ? { ...c, messages: [...c.messages, newMsg] } : c
-      )
+      prev.map((c) => {
+        if (c.id !== targetId) return c;
+        if (c.messages.some((m) => m.id === newMsgId)) return c;
+        return { ...c, messages: [...c.messages, newMsg] };
+      })
     );
     setReplyingTo(null);
     setShowEmojiPicker(false);
@@ -1884,22 +2330,12 @@ export default function App() {
         timestamp: nowTime,
         type: 'sticker',
         stickerId: sticker.id,
-        stickerEmoji: `${sticker.emoji}${sticker.secondaryEmoji}`,
+        stickerEmoji: stickerEmojiCombined,
         stickerLabel: sticker.label,
         stickerGradient: sticker.gradient,
         stickerPackId: sticker.packId,
       }),
     }).catch(() => {});
-
-    sendMessageToFirestore({
-      id: newMsgId,
-      senderPhone: effectiveSenderPhone,
-      senderName: effectiveSenderName,
-      recipientPhone: isGroupChat ? `group:${targetId}` : targetPhone,
-      text: stickerSummaryText,
-      timestamp: nowTime,
-      type: 'sticker',
-    });
 
     const recipientUid =
       selectedContact.uid ||
@@ -1907,23 +2343,49 @@ export default function App() {
         ? selectedContact.id
         : '');
 
+    sendMessageToFirestore({
+      id: newMsgId,
+      senderPhone: effectiveSenderPhone,
+      senderName: effectiveSenderName,
+      senderAvatar: effectiveSenderAvatar,
+      recipientPhone: isGroupChat ? `group:${targetId}` : targetPhone,
+      recipientUid: recipientUid || undefined,
+      senderUsername: userUsername,
+      text: stickerSummaryText,
+      timestamp: nowTime,
+      type: 'sticker',
+      stickerId: sticker.id,
+      stickerEmoji: stickerEmojiCombined,
+      stickerLabel: sticker.label,
+      stickerGradient: sticker.gradient,
+      stickerPackId: sticker.packId,
+    });
+
     if (!isGroupChat && myUid && recipientUid && myUid !== recipientUid) {
       sendDirectMessageToAuthorizedChat({
+        id: newMsgId,
         senderUid: myUid,
         recipientUid,
         senderName: effectiveSenderName,
         senderUsername: userUsername,
+        senderAvatar: effectiveSenderAvatar,
         recipientName: selectedContact.name,
         recipientUsername: selectedContact.username,
         text: stickerSummaryText,
         type: 'sticker',
+        stickerId: sticker.id,
+        stickerEmoji: stickerEmojiCombined,
+        stickerLabel: sticker.label,
+        stickerGradient: sticker.gradient,
+        stickerPackId: sticker.packId,
+        displayTime: nowTime,
       }).catch(() => {});
     }
 
     simulateMessageLifecycle(targetId, newMsgId);
   };
 
-  // Send Voice Note (Synced in real-time with friends!)
+  // Send Voice Note (Synced in real-time with friends with guaranteed valid duration!)
   const handleFinishVoiceNote = () => {
     if (!selectedContact || selectedContact.isBlocked) return;
     const myUid = currentUserUid || auth.currentUser?.uid || '';
@@ -1933,25 +2395,38 @@ export default function App() {
       setViewMode('registration');
       return;
     }
+
+    const dedupeKey = `voice:${selectedContact.id}`;
+    if (inFlightSendKeysRef.current.has(dedupeKey)) {
+      return;
+    }
+    inFlightSendKeysRef.current.add(dedupeKey);
+    setTimeout(() => {
+      inFlightSendKeysRef.current.delete(dedupeKey);
+    }, 800);
+
     const durMin = Math.floor(recordingSeconds / 60);
     const durSec = (recordingSeconds % 60).toString().padStart(2, '0');
-    const durationStr = `${durMin}:${durSec === '00' ? '04' : durSec}`;
+    const durationStr = formatSafeVoiceDuration(`${durMin}:${durSec === '00' ? '04' : durSec}`);
 
-    const nowTime = new Date().toLocaleTimeString('ar-EG', {
+    const nowMs = Date.now();
+    const nowTime = new Date(nowMs).toLocaleTimeString('ar-EG', {
       hour: '2-digit',
       minute: '2-digit',
     });
 
     const isGroupChat = Boolean(selectedContact.isGroup);
-    const newMsgId = `voice-${Date.now()}`;
+    const newMsgId = `voice_${nowMs}_${Math.random().toString(36).slice(2, 7)}`;
     const newMsg: Message = {
       id: newMsgId,
       senderId: 'me',
+      senderUid: myUid,
       senderName: userName,
       senderPhone: userPhone,
       senderAvatar: userAvatar,
       text: '',
       timestamp: nowTime,
+      createdAtMs: nowMs,
       status: 'sent',
       type: 'voice',
       voiceDuration: durationStr,
@@ -1961,9 +2436,11 @@ export default function App() {
     const targetId = selectedContact.id;
     const targetPhone = selectedContact.phone;
     setContacts((prev) =>
-      prev.map((c) =>
-        c.id === targetId ? { ...c, messages: [...c.messages, newMsg] } : c
-      )
+      prev.map((c) => {
+        if (c.id !== targetId) return c;
+        if (c.messages.some((m) => m.id === newMsgId)) return c;
+        return { ...c, messages: [...c.messages, newMsg] };
+      })
     );
     setIsRecordingVoice(false);
 
@@ -1989,16 +2466,35 @@ export default function App() {
       (!isGroupChat && !DEMO_CONTACT_IDS.has(selectedContact.id)
         ? selectedContact.id
         : '');
+
+    sendMessageToFirestore({
+      id: newMsgId,
+      senderPhone: userPhone,
+      senderName: userName,
+      senderAvatar: userAvatar,
+      recipientPhone: isGroupChat ? `group:${targetId}` : targetPhone,
+      recipientUid: recipientUid || undefined,
+      senderUsername: userUsername,
+      text: '🎤 رسالة صوتية',
+      timestamp: nowTime,
+      type: 'voice',
+      voiceDuration: durationStr,
+    });
+
     if (!isGroupChat && myUid && recipientUid && myUid !== recipientUid) {
       sendDirectMessageToAuthorizedChat({
+        id: newMsgId,
         senderUid: myUid,
         recipientUid,
         senderName: userName,
         senderUsername: userUsername,
+        senderAvatar: userAvatar,
         recipientName: selectedContact.name,
         recipientUsername: selectedContact.username,
         text: '🎤 رسالة صوتية',
         type: 'voice',
+        voiceDuration: durationStr,
+        displayTime: nowTime,
       }).catch(() => {});
     }
 
@@ -2014,12 +2510,23 @@ export default function App() {
       setViewMode('registration');
       return;
     }
+
+    const dedupeKey = `img:${selectedContact.id}:${customTitle || 'sample'}`;
+    if (inFlightSendKeysRef.current.has(dedupeKey)) {
+      return;
+    }
+    inFlightSendKeysRef.current.add(dedupeKey);
+    setTimeout(() => {
+      inFlightSendKeysRef.current.delete(dedupeKey);
+    }, 800);
+
     const randomImg =
       customUrl ||
       SAMPLE_SHARED_IMAGES[
         Math.floor(Math.random() * SAMPLE_SHARED_IMAGES.length)
       ];
-    const nowTime = new Date().toLocaleTimeString('ar-EG', {
+    const nowMs = Date.now();
+    const nowTime = new Date(nowMs).toLocaleTimeString('ar-EG', {
       hour: '2-digit',
       minute: '2-digit',
     });
@@ -2028,15 +2535,17 @@ export default function App() {
     const captionText =
       customTitle ||
       (inputText.trim() ? inputText.trim() : 'مشاركة صورة عبر SAHPY-CHAT ✨');
-    const newMsgId = `img-${Date.now()}`;
+    const newMsgId = `img_${nowMs}_${Math.random().toString(36).slice(2, 7)}`;
     const newMsg: Message = {
       id: newMsgId,
       senderId: 'me',
+      senderUid: myUid,
       senderName: userName,
       senderPhone: userPhone,
       senderAvatar: userAvatar,
       text: '',
       timestamp: nowTime,
+      createdAtMs: nowMs,
       status: 'sent',
       type: 'image',
       imageUrl: randomImg,
@@ -2051,10 +2560,12 @@ export default function App() {
         c.id === targetId
           ? {
               ...c,
-              messages: [...c.messages, newMsg],
+              messages: c.messages.some((m) => m.id === newMsgId)
+                ? c.messages
+                : [...c.messages, newMsg],
               sharedMedia: [
                 {
-                  id: `media-${Date.now()}`,
+                  id: `media-${nowMs}`,
                   url: randomImg,
                   title: customTitle || `صورة_مرسلة_${c.sharedMedia.length + 1}.jpg`,
                   date: 'الآن',
@@ -2091,16 +2602,37 @@ export default function App() {
       (!isGroupChat && !DEMO_CONTACT_IDS.has(selectedContact.id)
         ? selectedContact.id
         : '');
+
+    sendMessageToFirestore({
+      id: newMsgId,
+      senderPhone: userPhone,
+      senderName: userName,
+      senderAvatar: userAvatar,
+      recipientPhone: isGroupChat ? `group:${targetId}` : targetPhone,
+      recipientUid: recipientUid || undefined,
+      senderUsername: userUsername,
+      text: captionText,
+      timestamp: nowTime,
+      type: 'image',
+      imageUrl: randomImg,
+      imageCaption: captionText,
+    });
+
     if (!isGroupChat && myUid && recipientUid && myUid !== recipientUid) {
       sendDirectMessageToAuthorizedChat({
+        id: newMsgId,
         senderUid: myUid,
         recipientUid,
         senderName: userName,
         senderUsername: userUsername,
+        senderAvatar: userAvatar,
         recipientName: selectedContact.name,
         recipientUsername: selectedContact.username,
         text: captionText,
         type: 'image',
+        imageUrl: randomImg,
+        imageCaption: captionText,
+        displayTime: nowTime,
       }).catch(() => {});
     }
 
@@ -2227,6 +2759,7 @@ export default function App() {
                   senderAvatar: randomGroupResponder ? randomGroupResponder.avatar : c.avatar,
                   text: randomReply,
                   timestamp: replyTime,
+                  createdAtMs: Date.now(),
                   status: 'read',
                   type: 'text',
                   reactions: [],
@@ -2312,15 +2845,136 @@ export default function App() {
     }
   };
 
-  // Clear Chat History
+  // Open Clear / Delete Chat Confirmation Modal (Always requires explicit user confirmation!)
+  const handleOpenChatActionModal = (
+    targetContact: Contact | undefined = selectedContact,
+    initialAction: 'clear' | 'delete' = 'clear',
+    e?: React.MouseEvent
+  ) => {
+    if (e) e.stopPropagation();
+    if (!targetContact) return;
+    const myUid = currentUserUid || auth.currentUser?.uid || '';
+    if (!myUid || !auth.currentUser || !auth.currentUser.emailVerified) {
+      triggerToast('يجب تسجيل الدخول وتأكيد هويتك أولاً لتنفيذ هذه العملية 🔒');
+      return;
+    }
+    setActiveHeaderMenu(false);
+    setChatActionModal({
+      isOpen: true,
+      contact: targetContact,
+      initialAction,
+    });
+  };
+
+  // Clear Chat History (Opens confirmation modal first)
   const handleClearChat = () => {
-    if (!selectedContact) return;
-    setContacts((prev) =>
-      prev.map((c) =>
-        c.id === selectedContact.id ? { ...c, messages: [] } : c
-      )
-    );
-    triggerToast(`تم مسح سجل الرسائل مع "${selectedContact.name}" 🗑️`);
+    handleOpenChatActionModal(selectedContact, 'clear');
+  };
+
+  // Execute Confirmed Clear or Delete Conversation (Syncs Local State, Firestore & Backend)
+  const handleConfirmClearOrDeleteChat = async (
+    actionType: 'clear' | 'delete',
+    scope: 'me' | 'both'
+  ) => {
+    const target = chatActionModal.contact;
+    if (!target) return;
+
+    const myUid = currentUserUid || auth.currentUser?.uid || '';
+    if (!myUid || !auth.currentUser || !auth.currentUser.emailVerified) {
+      setChatActionModal({ isOpen: false, contact: null, initialAction: 'clear' });
+      triggerToast('غير مصرح بتنفيذ العملية بدون تسجيل دخول صالح 🔒');
+      return;
+    }
+
+    const nowMs = Date.now();
+    const otherUid =
+      target.uid || (!target.isGroup && !DEMO_CONTACT_IDS.has(target.id) ? target.id : '');
+    const chatId =
+      target.chatId ||
+      (myUid && otherUid && myUid !== otherUid
+        ? getDeterministicChatId(myUid, otherUid)
+        : '');
+
+    // Record clearedAtMs so neither old listeners nor polling bring back cleared messages
+    setClearedChatsMap((prev) => {
+      const next = { ...prev, [target.id]: nowMs };
+      if (otherUid) next[otherUid] = nowMs;
+      if (chatId) next[chatId] = nowMs;
+      return next;
+    });
+
+    if (actionType === 'delete') {
+      setDeletedContactIds((prev) => {
+        const next = { ...prev, [target.id]: nowMs };
+        if (otherUid) next[otherUid] = nowMs;
+        if (chatId) next[chatId] = nowMs;
+        return next;
+      });
+    }
+
+    // Clear messages on backend server if scope === 'both'
+    if (scope === 'both') {
+      fetch('/api/chats/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          groupId: target.isGroup ? target.id : undefined,
+          participantPhoneA: userPhone,
+          participantPhoneB: target.phone,
+          scope: 'both',
+        }),
+      }).catch(() => {});
+    }
+
+    // Clear / delete in Firestore according to user's chosen scope and permissions
+    if (myUid && otherUid && myUid !== otherUid) {
+      await clearAuthorizedChatMessagesInFirestore({
+        myUid,
+        otherUid,
+        contactId: target.id,
+        scope,
+      }).catch(() => {});
+    }
+
+    if (actionType === 'clear') {
+      const clearedContact: Contact = {
+        ...target,
+        messages: [],
+        unreadCount: 0,
+        clearedAtMs: nowMs,
+      };
+      setContacts((prev) =>
+        prev.map((c) => (c.id === target.id ? clearedContact : c))
+      );
+      syncContactToFirestore(clearedContact);
+      setChatActionModal({ isOpen: false, contact: null, initialAction: 'clear' });
+      triggerToast(
+        scope === 'both'
+          ? `تم مسح محتوى المحادثة مع "${target.name}" لدى الطرفين بنجاح 🗑️`
+          : `تم مسح محتوى المحادثة مع "${target.name}" من جهتك بنجاح 🗑️`
+      );
+    } else {
+      await deleteSavedContactFromFirestore(myUid, target.id, otherUid, scope);
+      if (otherUid && otherUid !== target.id) {
+        await deleteSavedContactFromFirestore(myUid, otherUid, otherUid, scope);
+      }
+      setContacts((prev) => {
+        const remaining = prev.filter(
+          (c) => c.id !== target.id && (!otherUid || c.uid !== otherUid)
+        );
+        if (selectedContactId === target.id) {
+          setSelectedContactId(remaining[0]?.id || '');
+        }
+        return remaining;
+      });
+      setIsInfoDrawerOpen(false);
+      setChatActionModal({ isOpen: false, contact: null, initialAction: 'clear' });
+      triggerToast(
+        scope === 'both'
+          ? `تم حذف المحادثة مع "${target.name}" ومسح رسائلها لدى الطرفين 🗑️`
+          : `تم حذف المحادثة مع "${target.name}" من قائمتك بنجاح 🗑️`
+      );
+    }
   };
 
   // Toggle Reaction on a Message
@@ -2439,6 +3093,7 @@ export default function App() {
       senderId: 'me',
       text: replyText,
       timestamp: nowTime,
+      createdAtMs: Date.now(),
       status: 'sent',
       type: 'text',
       reactions: [],
@@ -2539,6 +3194,7 @@ export default function App() {
     let resolvedUid = targetUid || '';
     let resolvedUsername = normalizeUsername(username);
     let resolvedName = name;
+    let resolvedAvatar = avatar;
 
     if (!resolvedUid) {
       const found = await findRegisteredUserInFirestore(
@@ -2548,6 +3204,7 @@ export default function App() {
         resolvedUid = found.uid;
         resolvedUsername = found.username;
         resolvedName = found.displayName || name;
+        resolvedAvatar = found.avatarUrl || avatar;
       } else {
         const localReg = registeredUsers.find(
           (u) =>
@@ -2558,6 +3215,7 @@ export default function App() {
           resolvedUid = localReg.uid || localReg.id;
           resolvedUsername = normalizeUsername(localReg.username);
           resolvedName = localReg.name || name;
+          resolvedAvatar = localReg.avatar || avatar;
         }
       }
     }
@@ -2583,23 +3241,42 @@ export default function App() {
             normalizeUsername(c.username) === resolvedUsername))
     );
 
+    const chatId =
+      myUid && resolvedUid
+        ? getDeterministicChatId(myUid, resolvedUid)
+        : undefined;
+
+    const safeTargetAvatar = normalizeUserAvatarUrl(
+      resolvedAvatar,
+      resolvedUid,
+      resolvedName
+    );
+
+    // Clear any deleted contact marker if the user starts a chat again
+    setDeletedContactIds((prev) => {
+      if (!prev[resolvedUid] && (!chatId || !prev[chatId])) return prev;
+      const next = { ...prev };
+      delete next[resolvedUid];
+      if (chatId) delete next[chatId];
+      return next;
+    });
+
     if (existing) {
       setSelectedContactId(existing.id);
       setMobileShowChat(true);
       return;
     }
 
-    const chatId =
-      myUid && resolvedUid
-        ? getDeterministicChatId(myUid, resolvedUid)
-        : undefined;
-
     if (myUid && resolvedUid) {
       await ensureAuthorizedChatRoomInFirestore({
         myUid,
         otherUid: resolvedUid,
+        myName: userName,
+        otherName: resolvedName,
         myUsername: userUsername,
         otherUsername: resolvedUsername || normalizeUsername(resolvedName),
+        myAvatar: userAvatar,
+        otherAvatar: safeTargetAvatar,
       });
     }
 
@@ -2612,7 +3289,7 @@ export default function App() {
       name: resolvedName,
       phone,
       username: cleanUser,
-      avatar: avatar || omarAvatar,
+      avatar: safeTargetAvatar,
       roleOrBio,
       isOnline: true,
       lastSeen: 'موثق في Firestore',
@@ -2633,14 +3310,19 @@ export default function App() {
     );
   };
 
-  // Save User Profile
+  // Save User Profile & Sync Avatar across Local State, Firestore, Chat Rooms & Stories
   const handleSaveProfile = (
     name: string,
     phone: string,
     bio: string,
     avatar?: string
   ) => {
-    const finalAvatar = avatar || userAvatar;
+    const myUid = currentUserUid || auth.currentUser?.uid || '';
+    const finalAvatar = normalizeUserAvatarUrl(
+      avatar || userAvatar,
+      myUid || userUsername,
+      name
+    );
     setUserName(name);
     setUserPhone(phone);
     setUserBio(bio);
@@ -2649,7 +3331,31 @@ export default function App() {
     localStorage.setItem('nabd_user_phone', phone);
     localStorage.setItem('nabd_user_bio', bio);
     localStorage.setItem('nabd_user_avatar', finalAvatar);
+
+    // Update own avatar in active stories immediately
+    setStories((prev) =>
+      prev.map((s) =>
+        s.contactId === 'me' ||
+        (userUsername && normalizeUsername(s.userUsername) === normalizeUsername(userUsername))
+          ? { ...s, avatar: finalAvatar, userName: `${name} (حالتي)` }
+          : s
+      )
+    );
+
+    if (auth.currentUser && auth.currentUser.emailVerified) {
+      updateUserProfileAndSyncAvatarInFirestore({
+        uid: auth.currentUser.uid,
+        name,
+        phone,
+        username: userUsername,
+        email: auth.currentUser.email || undefined,
+        bio,
+        avatarUrl: finalAvatar,
+      }).catch(() => {});
+    }
+
     handleCompleteRegistration({
+      uid: myUid || undefined,
       name,
       phone,
       username: userUsername,
@@ -2657,7 +3363,8 @@ export default function App() {
       avatar: finalAvatar,
       stayOnScreen: true,
     }).catch(() => {});
-    triggerToast('تم حفظ الملف الشخصي وصورة البروفايل بنجاح ✅');
+
+    triggerToast('تم حفظ الملف الشخصي وتحديث صورتك لدى جميع جهات الاتصال بنجاح ✅');
   };
 
   // Bubble Accent Styling Map
@@ -2699,7 +3406,28 @@ export default function App() {
       currentUserUid
   );
 
-  // Show Aurora Sign Up Screen if viewMode === 'registration' or user is not yet authenticated & verified
+  // While Firebase Auth is restoring the persisted user session on page refresh, show a clean loading screen
+  // so the user is never briefly flashed with the login screen when their session is valid!
+  if (isAuthInitializing) {
+    return (
+      <div
+        dir="rtl"
+        className="w-screen h-dvh bg-slate-950 flex flex-col items-center justify-center p-6 text-center select-none"
+      >
+        <div className="w-16 h-16 rounded-3xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center mb-4 shadow-2xl">
+          <div className="w-8 h-8 rounded-full border-3 border-emerald-400 border-t-transparent animate-spin" />
+        </div>
+        <h2 className="text-base font-extrabold text-white">
+          SAHPY-CHAT • جاري استعادة جلستك الآمنة...
+        </h2>
+        <p className="text-xs text-slate-400 mt-1">
+          يتم التحقق من حالة تسجيل الدخول وربط حسابك بقاعدة بيانات Cloud Firestore
+        </p>
+      </div>
+    );
+  }
+
+  // Show Aurora Sign Up Screen if user explicitly opened account screen or is not yet authenticated & verified
   if (viewMode === 'registration' || !canEnterProtectedChats) {
     return (
       <PhoneRegistrationScreen
@@ -2716,7 +3444,12 @@ export default function App() {
         onLogout={handleRealLogout}
         onStartChatWithUser={handleStartChatWithDirectoryUser}
         onBackToChats={
-          canEnterProtectedChats ? () => setViewMode('chat') : undefined
+          canEnterProtectedChats
+            ? () => {
+                setManualAccountScreen(false);
+                setViewMode('chat');
+              }
+            : undefined
         }
       />
     );
@@ -2804,7 +3537,10 @@ export default function App() {
 
             <div className="flex items-center gap-1 shrink-0">
               <button
-                onClick={() => setViewMode('registration')}
+                onClick={() => {
+                  setManualAccountScreen(true);
+                  setViewMode('registration');
+                }}
                 className="px-2.5 py-2 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-white text-[11px] font-bold flex items-center gap-1 transition-all cursor-pointer"
                 title="إدارة الحساب والتحقق"
               >
@@ -3240,7 +3976,7 @@ export default function App() {
                                 </span>
                               )}
                               {lastMsg.type === 'voice'
-                                ? `🎤 رسالة صوتية (${lastMsg.voiceDuration})`
+                                ? `🎤 رسالة صوتية (${formatSafeVoiceDuration(lastMsg.voiceDuration)})`
                                 : lastMsg.type === 'image'
                                 ? '📷 صورة مرفقة'
                                 : lastMsg.type === 'sticker'
@@ -3271,6 +4007,16 @@ export default function App() {
                             title={contact.isPinned ? 'إلغاء التثبيت' : 'تثبيت'}
                           >
                             <Pin className="w-3 h-3" />
+                          </button>
+
+                          <button
+                            onClick={(e) =>
+                              handleOpenChatActionModal(contact, 'delete', e)
+                            }
+                            className="opacity-0 group-hover:opacity-100 p-1 rounded-lg hover:bg-rose-500/20 text-slate-400 hover:text-rose-300 transition-all cursor-pointer"
+                            title="حذف المحادثة من القائمة"
+                          >
+                            <Trash2 className="w-3 h-3" />
                           </button>
                         </div>
                       </div>
@@ -3467,6 +4213,17 @@ export default function App() {
                     <Info className="w-4 h-4" />
                   </button>
 
+                  <button
+                    onClick={() =>
+                      handleOpenChatActionModal(selectedContact, 'clear')
+                    }
+                    className="px-2.5 py-2 rounded-xl bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 text-amber-300 text-xs font-medium flex items-center gap-1.5 transition-all cursor-pointer"
+                    title="مسح المحادثة"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    <span className="hidden lg:inline">مسح المحادثة</span>
+                  </button>
+
                   {/* Dropdown Menu */}
                   <div className="relative">
                     <button
@@ -3500,13 +4257,23 @@ export default function App() {
                         </button>
                         <button
                           onClick={() => {
-                            handleClearChat();
+                            handleOpenChatActionModal(selectedContact, 'clear');
                             setActiveHeaderMenu(false);
                           }}
                           className="w-full px-4 py-2.5 text-right hover:bg-white/5 flex items-center gap-2.5 text-amber-300 cursor-pointer"
                         >
                           <Trash2 className="w-4 h-4" />
-                          <span>مسح محتوى الدردشة</span>
+                          <span>مسح المحادثة</span>
+                        </button>
+                        <button
+                          onClick={() => {
+                            handleOpenChatActionModal(selectedContact, 'delete');
+                            setActiveHeaderMenu(false);
+                          }}
+                          className="w-full px-4 py-2.5 text-right hover:bg-rose-500/10 flex items-center gap-2.5 text-rose-300 cursor-pointer"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                          <span>حذف المحادثة من القائمة</span>
                         </button>
                       </div>
                     )}
@@ -3715,7 +4482,7 @@ export default function App() {
                                 </div>
                                 <div className="flex justify-between text-[10px] text-white/75">
                                   <span>رسالة صوتية</span>
-                                  <span>{msg.voiceDuration || '0:30'}</span>
+                                  <span>{formatSafeVoiceDuration(msg.voiceDuration)}</span>
                                 </div>
                               </div>
                             </div>
@@ -4246,6 +5013,9 @@ export default function App() {
               setIsWallpaperStudioOpen(true);
             }}
             onClearChat={handleClearChat}
+            onDeleteConversation={() =>
+              handleOpenChatActionModal(selectedContact, 'delete')
+            }
             onToggleDisappearing={() => {}}
             onAddGroupMember={handleAddGroupMember}
             onRemoveGroupMember={handleRemoveGroupMember}
@@ -4259,6 +5029,23 @@ export default function App() {
             />
           )}
         </>
+      )}
+
+      {chatActionModal.isOpen && chatActionModal.contact && (
+        <ClearOrDeleteChatModal
+          contact={chatActionModal.contact}
+          mode={chatActionModal.initialAction}
+          onClose={() =>
+            setChatActionModal({
+              isOpen: false,
+              contact: null,
+              initialAction: 'clear',
+            })
+          }
+          onConfirm={(scope) =>
+            handleConfirmClearOrDeleteChat(chatActionModal.initialAction, scope)
+          }
+        />
       )}
 
       {activeStory && (

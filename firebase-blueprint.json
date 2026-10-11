@@ -62,7 +62,13 @@
         },
         "phoneVerified": {
           "type": "boolean",
-          "description": "Whether the user's phone number has been verified via Firebase Phone Auth OTP."
+          "description": "Whether the user's phone number has been verified."
+        },
+        "avatarUrl": {
+          "type": "string",
+          "description": "Optional profile avatar URL or data URI.",
+          "minLength": 0,
+          "maxLength": 250000
         },
         "createdAt": {
           "type": "string",
@@ -132,7 +138,13 @@
         },
         "phoneVerified": {
           "type": "boolean",
-          "description": "Whether the user has verified their phone number via SMS OTP."
+          "description": "Whether the user has verified their phone number."
+        },
+        "avatarUrl": {
+          "type": "string",
+          "description": "Optional public profile avatar URL or data URI.",
+          "minLength": 0,
+          "maxLength": 250000
         },
         "createdAt": {
           "type": "string",

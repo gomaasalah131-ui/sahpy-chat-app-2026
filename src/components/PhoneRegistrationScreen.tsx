@@ -261,6 +261,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
           if (prof) {
             if (prof.displayName) setFullName(prof.displayName);
             if (prof.username) setUsername(prof.username);
+            if (prof.avatarUrl) setAvatarUrl(prof.avatarUrl);
             if (prof.phoneTag) {
               const split = splitPhoneIntoCountryAndLocal(prof.phoneTag);
               setCountryCode(split.countryCode);
@@ -603,6 +604,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                 `حساب موثق على SAHPY-CHAT • @${candidateUsername} ✨`,
               wallpaperTheme: 'aurora-borealis',
               phoneVerified: false,
+              avatarUrl,
             });
           }
         } catch {
@@ -614,6 +616,9 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
         setFullName(existingProfile.displayName);
         setUsername(existingProfile.username);
         setEmail(existingProfile.email);
+        if (existingProfile.avatarUrl) {
+          setAvatarUrl(existingProfile.avatarUrl);
+        }
         if (existingProfile.phoneTag) {
           const split = splitPhoneIntoCountryAndLocal(existingProfile.phoneTag);
           setCountryCode(split.countryCode);
@@ -634,7 +639,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
           username: existingProfile.username,
           email: loggedInUser.email || existingProfile.email,
           bio: existingProfile.bio,
-          avatar: avatarUrl,
+          avatar: existingProfile.avatarUrl || avatarUrl,
           emailVerified: true,
           phoneVerified: false,
           stayOnScreen: false,
@@ -685,7 +690,8 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
           username: existingProfile.username,
           email: googleUser.email || existingProfile.email,
           bio: existingProfile.bio,
-          avatar: googleUser.photoURL || avatarUrl,
+          avatar:
+            existingProfile.avatarUrl || googleUser.photoURL || avatarUrl,
           emailVerified: true,
           phoneVerified: false,
           stayOnScreen: false,
@@ -818,6 +824,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
           `حساب موثق على SAHPY-CHAT • @${cleanUsername} ✨`,
         wallpaperTheme: 'aurora-borealis',
         phoneVerified: false,
+        avatarUrl,
       });
 
       await onCompleteRegistration({
@@ -827,7 +834,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
         username: savedProfile.username,
         email: savedProfile.email,
         bio: savedProfile.bio,
-        avatar: avatarUrl,
+        avatar: savedProfile.avatarUrl || avatarUrl,
         emailVerified: savedProfile.emailVerified,
         phoneVerified: false,
         stayOnScreen: false,

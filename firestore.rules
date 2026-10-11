@@ -62,6 +62,7 @@ service cloud.firestore {
           'wallpaperTheme',
           'emailVerified',
           'phoneVerified',
+          'avatarUrl',
           'createdAt',
           'updatedAt'
         ])
@@ -98,6 +99,7 @@ service cloud.firestore {
         )
         && data.emailVerified is bool
         && data.phoneVerified is bool
+        && (!('avatarUrl' in data) || (data.avatarUrl is string && data.avatarUrl.size() <= 250000))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -123,6 +125,7 @@ service cloud.firestore {
           'avatarFallbackColor',
           'emailVerified',
           'phoneVerified',
+          'avatarUrl',
           'createdAt',
           'updatedAt'
         ])
@@ -145,6 +148,7 @@ service cloud.firestore {
         && data.avatarFallbackColor.size() <= 40
         && data.emailVerified is bool
         && data.phoneVerified is bool
+        && (!('avatarUrl' in data) || (data.avatarUrl is string && data.avatarUrl.size() <= 250000))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -166,6 +170,7 @@ service cloud.firestore {
           'displayName',
           'bio',
           'avatarFallbackColor',
+          'avatarUrl',
           'createdAt',
           'updatedAt'
         ])
@@ -186,6 +191,7 @@ service cloud.firestore {
         && data.avatarFallbackColor is string
         && data.avatarFallbackColor.size() >= 1
         && data.avatarFallbackColor.size() <= 40
+        && (!('avatarUrl' in data) || (data.avatarUrl is string && data.avatarUrl.size() <= 250000))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -209,6 +215,7 @@ service cloud.firestore {
           'displayName',
           'bio',
           'avatarFallbackColor',
+          'avatarUrl',
           'createdAt',
           'updatedAt'
         ])
@@ -233,6 +240,7 @@ service cloud.firestore {
         && data.avatarFallbackColor is string
         && data.avatarFallbackColor.size() >= 1
         && data.avatarFallbackColor.size() <= 40
+        && (!('avatarUrl' in data) || (data.avatarUrl is string && data.avatarUrl.size() <= 250000))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -262,6 +270,8 @@ service cloud.firestore {
           'participantTwoName',
           'participantOneUsername',
           'participantTwoUsername',
+          'participantOneAvatar',
+          'participantTwoAvatar',
           'createdByUid',
           'lastMessageText',
           'lastMessageSenderUid',
@@ -295,12 +305,14 @@ service cloud.firestore {
         && data.participantTwoUsername.size() >= 3
         && data.participantTwoUsername.size() <= 30
         && data.participantTwoUsername.matches('^[a-z0-9_]+$')
+        && (!('participantOneAvatar' in data) || (data.participantOneAvatar is string && data.participantOneAvatar.size() <= 250000))
+        && (!('participantTwoAvatar' in data) || (data.participantTwoAvatar is string && data.participantTwoAvatar.size() <= 250000))
         && data.createdByUid is string
         && data.createdByUid.size() >= 1
         && data.createdByUid.size() <= 128
         && data.createdByUid.matches('^[a-zA-Z0-9_\\-]+$')
         && data.lastMessageText is string
-        && data.lastMessageText.size() >= 1
+        && data.lastMessageText.size() >= 0
         && data.lastMessageText.size() <= 500
         && data.lastMessageSenderUid is string
         && data.lastMessageSenderUid.size() >= 1
@@ -335,8 +347,17 @@ service cloud.firestore {
           'recipientUid',
           'senderName',
           'senderUsername',
+          'senderAvatar',
           'text',
           'messageType',
+          'voiceDuration',
+          'imageUrl',
+          'imageCaption',
+          'stickerId',
+          'stickerEmoji',
+          'stickerLabel',
+          'stickerGradient',
+          'stickerPackId',
           'displayTime',
           'isStarred',
           'isPinned',
@@ -363,6 +384,7 @@ service cloud.firestore {
         && data.senderUsername.size() >= 3
         && data.senderUsername.size() <= 30
         && data.senderUsername.matches('^[a-z0-9_]+$')
+        && (!('senderAvatar' in data) || (data.senderAvatar is string && data.senderAvatar.size() <= 250000))
         && data.text is string
         && data.text.size() >= 1
         && data.text.size() <= 2000
@@ -376,6 +398,14 @@ service cloud.firestore {
           data.messageType == 'poll' ||
           data.messageType == 'sticker'
         )
+        && (!('voiceDuration' in data) || (data.voiceDuration is string && data.voiceDuration.size() <= 20))
+        && (!('imageUrl' in data) || (data.imageUrl is string && data.imageUrl.size() <= 350000))
+        && (!('imageCaption' in data) || (data.imageCaption is string && data.imageCaption.size() <= 500))
+        && (!('stickerId' in data) || (data.stickerId is string && data.stickerId.size() <= 60))
+        && (!('stickerEmoji' in data) || (data.stickerEmoji is string && data.stickerEmoji.size() <= 40))
+        && (!('stickerLabel' in data) || (data.stickerLabel is string && data.stickerLabel.size() <= 100))
+        && (!('stickerGradient' in data) || (data.stickerGradient is string && data.stickerGradient.size() <= 160))
+        && (!('stickerPackId' in data) || (data.stickerPackId is string && data.stickerPackId.size() <= 40))
         && data.displayTime is string
         && data.displayTime.size() >= 1
         && data.displayTime.size() <= 40
@@ -404,6 +434,9 @@ service cloud.firestore {
           'contactName',
           'contactPhone',
           'contactBio',
+          'contactAvatar',
+          'contactUsername',
+          'clearedAtMs',
           'avatarFallbackColor',
           'isMuted',
           'isBlocked',
@@ -425,6 +458,9 @@ service cloud.firestore {
         && data.contactPhone.matches('^[0-9+]+$')
         && data.contactBio is string
         && data.contactBio.size() <= 200
+        && (!('contactAvatar' in data) || (data.contactAvatar is string && data.contactAvatar.size() <= 250000))
+        && (!('contactUsername' in data) || (data.contactUsername is string && data.contactUsername.size() <= 40))
+        && (!('clearedAtMs' in data) || (data.clearedAtMs is int || data.clearedAtMs is number))
         && data.avatarFallbackColor is string
         && data.avatarFallbackColor.size() >= 1
         && data.avatarFallbackColor.size() <= 40
@@ -557,6 +593,7 @@ service cloud.firestore {
             'wallpaperTheme',
             'emailVerified',
             'phoneVerified',
+            'avatarUrl',
             'updatedAt'
           ])
         );
@@ -575,8 +612,8 @@ service cloud.firestore {
           && isParentUserOwner(userId);
 
         allow list: if isSignedIn()
-          && request.auth.uid == userId
-          && existing().ownerUid == request.auth.uid;
+          && isValidId(userId)
+          && request.auth.uid == userId;
 
         allow create: if isVerifiedUser()
           && isValidId(userId)
@@ -599,7 +636,12 @@ service cloud.firestore {
           && (
             incoming().diff(existing()).affectedKeys().hasOnly([
               'contactName',
+              'contactPhone',
               'contactBio',
+              'contactAvatar',
+              'contactUsername',
+              'clearedAtMs',
+              'avatarFallbackColor',
               'isMuted',
               'isBlocked',
               'isPinned',
@@ -625,8 +667,9 @@ service cloud.firestore {
             && isParentContactOwner(userId, contactId);
 
           allow list: if isSignedIn()
-            && request.auth.uid == userId
-            && existing().ownerUid == request.auth.uid;
+            && isValidId(userId)
+            && isValidId(contactId)
+            && request.auth.uid == userId;
 
           allow create: if isVerifiedUser()
             && isValidId(userId)
@@ -701,6 +744,7 @@ service cloud.firestore {
             'avatarFallbackColor',
             'emailVerified',
             'phoneVerified',
+            'avatarUrl',
             'updatedAt'
           ])
         );
@@ -738,6 +782,7 @@ service cloud.firestore {
             'displayName',
             'bio',
             'avatarFallbackColor',
+            'avatarUrl',
             'updatedAt'
           ])
         );
@@ -776,6 +821,7 @@ service cloud.firestore {
             'displayName',
             'bio',
             'avatarFallbackColor',
+            'avatarUrl',
             'updatedAt'
           ])
         );
@@ -829,7 +875,10 @@ service cloud.firestore {
         && incoming().createdByUid == existing().createdByUid
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
-        && incoming().lastMessageSenderUid == request.auth.uid
+        && (
+          incoming().lastMessageSenderUid == request.auth.uid ||
+          incoming().lastMessageSenderUid == existing().lastMessageSenderUid
+        )
         && (
           incoming().diff(existing()).affectedKeys().hasOnly([
             'lastMessageText',
@@ -837,6 +886,10 @@ service cloud.firestore {
             'lastMessageTime',
             'participantOneName',
             'participantTwoName',
+            'participantOneUsername',
+            'participantTwoUsername',
+            'participantOneAvatar',
+            'participantTwoAvatar',
             'updatedAt'
           ])
         );
@@ -849,14 +902,20 @@ service cloud.firestore {
           && isValidId(chatId)
           && isValidId(messageId)
           && (
+            isAuthorizedChatParticipant(chatId) ||
+            chatId.matches('^' + request.auth.uid + '_[A-Za-z0-9_\\-]{1,128}$') ||
+            chatId.matches('^[A-Za-z0-9_\\-]{1,128}_' + request.auth.uid + '$') ||
             resource == null ||
             existing().senderUid == request.auth.uid ||
             existing().recipientUid == request.auth.uid
-          )
-          && isAuthorizedChatParticipant(chatId);
+          );
 
         allow list: if isSignedIn()
+          && isValidId(chatId)
           && (
+            isAuthorizedChatParticipant(chatId) ||
+            chatId.matches('^' + request.auth.uid + '_[A-Za-z0-9_\\-]{1,128}$') ||
+            chatId.matches('^[A-Za-z0-9_\\-]{1,128}_' + request.auth.uid + '$') ||
             existing().senderUid == request.auth.uid ||
             existing().recipientUid == request.auth.uid
           );
@@ -902,7 +961,10 @@ service cloud.firestore {
         allow delete: if isVerifiedUser()
           && isValidId(chatId)
           && isValidId(messageId)
-          && existing().senderUid == request.auth.uid
+          && (
+            existing().senderUid == request.auth.uid ||
+            existing().recipientUid == request.auth.uid
+          )
           && isAuthorizedChatParticipant(chatId);
       }
     }

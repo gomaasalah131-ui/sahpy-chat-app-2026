@@ -32,6 +32,7 @@ interface ContactInfoDrawerProps {
   onUnmuteQuick: () => void;
   onOpenBlockModal: () => void;
   onClearChat: () => void;
+  onDeleteConversation?: () => void;
   onOpenWallpaperStudio: () => void;
   onToggleDisappearing: (val: 'off' | '24h' | '7d' | '90d') => void;
   onAddGroupMember?: (groupId: string, member: GroupMember) => void;
@@ -47,6 +48,7 @@ export const ContactInfoDrawer: React.FC<ContactInfoDrawerProps> = ({
   onUnmuteQuick,
   onOpenBlockModal,
   onClearChat,
+  onDeleteConversation,
   onOpenWallpaperStudio,
   onToggleDisappearing,
   onAddGroupMember,
@@ -58,6 +60,10 @@ export const ContactInfoDrawer: React.FC<ContactInfoDrawerProps> = ({
   const [showAddMemberBox, setShowAddMemberBox] = useState(false);
   const [newMemberName, setNewMemberName] = useState('');
   const [newMemberPhone, setNewMemberPhone] = useState('');
+
+  React.useEffect(() => {
+    setImgError(false);
+  }, [contact.avatar, contact.id]);
 
   if (!isOpen) return null;
 
@@ -581,11 +587,22 @@ export const ContactInfoDrawer: React.FC<ContactInfoDrawerProps> = ({
             <button
               type="button"
               onClick={onClearChat}
-              className="flex w-full items-center gap-3 rounded-xl px-4 py-3 text-xs font-medium text-slate-300 transition-colors hover:bg-slate-800 hover:text-white"
+              className="flex w-full items-center gap-3 rounded-xl px-4 py-3 text-xs font-medium text-slate-300 transition-colors hover:bg-slate-800 hover:text-white cursor-pointer"
             >
-              <Trash2 className="h-4 w-4 text-slate-400" />
-              <span>مسح محتوى الدردشة</span>
+              <Trash2 className="h-4 w-4 text-amber-400" />
+              <span>مسح المحادثة</span>
             </button>
+
+            {onDeleteConversation && (
+              <button
+                type="button"
+                onClick={onDeleteConversation}
+                className="flex w-full items-center gap-3 rounded-xl px-4 py-3 text-xs font-medium text-rose-300 transition-colors hover:bg-rose-500/15 hover:text-rose-200 cursor-pointer"
+              >
+                <Trash2 className="h-4 w-4 text-rose-400" />
+                <span>حذف المحادثة من القائمة</span>
+              </button>
+            )}
 
             <button
               type="button"

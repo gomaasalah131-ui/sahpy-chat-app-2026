@@ -49,6 +49,7 @@ import {
   isValidPhoneE164Format,
   buildNormalizedPhoneSearchCandidates,
   formatDisplayPhone,
+  normalizeUserAvatarUrl,
 } from '../lib/firebase';
 
 export function formatRemaining24h(expiresAt?: number): string {
@@ -919,8 +920,11 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
         phone: `@${firestoreResult.username || firestoreResult.uid.slice(0, 8)}`,
         username: firestoreResult.username,
         bio: firestoreResult.bio || 'مستخدم مسجل في SAHPY-CHAT ✨',
-        avatar:
-          'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=240&auto=format&fit=crop&q=80',
+        avatar: normalizeUserAvatarUrl(
+          firestoreResult.avatarUrl,
+          firestoreResult.uid,
+          firestoreResult.displayName
+        ),
         emailVerified: firestoreResult.emailVerified,
         phoneVerified: false,
         isOnline: true,
@@ -952,6 +956,7 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
           ...u,
           id: uid,
           uid,
+          avatar: normalizeUserAvatarUrl(u.avatar, uid, u.name),
           phone: `@${u.username || uid.slice(0, 8)}`,
         });
       }
@@ -1730,6 +1735,163 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
             حفظ وتحديث الحساب في Firestore
           </button>
         </form>
+      </div>
+    </div>
+  );
+};
+
+// ==========================================
+// 7. Clear / Delete Conversation Confirmation Modal
+// ==========================================
+interface ClearOrDeleteChatModalProps {
+  contact: Contact;
+  mode: 'clear' | 'delete';
+  isProcessing?: boolean;
+  onClose: () => void;
+  onConfirm: (scope: 'me' | 'both') => void;
+}
+
+export const ClearOrDeleteChatModal: React.FC<ClearOrDeleteChatModalProps> = ({
+  contact,
+  mode,
+  isProcessing = false,
+  onClose,
+  onConfirm,
+}) => {
+  const [scope, setScope] = useState<'me' | 'both'>('me');
+
+  const isDeleteConversation = mode === 'delete';
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/85 backdrop-blur-md animate-fade-in">
+      <div className="w-full max-w-md rounded-3xl bg-slate-900 border border-rose-500/30 shadow-2xl overflow-hidden">
+        <div className="p-5 border-b border-white/10 flex items-center justify-between bg-rose-500/10">
+          <div className="flex items-center gap-2.5">
+            <div className="w-10 h-10 rounded-xl bg-rose-500/20 border border-rose-500/40 flex items-center justify-center text-rose-400">
+              <Trash2 className="w-5 h-5" />
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-white">
+                {isDeleteConversation
+                  ? 'تأكيد حذف المحادثة من القائمة'
+                  : 'تأكيد مسح محتوى المحادثة'}
+              </h3>
+              <p className="text-xs text-slate-300 truncate max-w-[230px]">
+                {contact.name}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={isProcessing}
+            className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-white/10 transition-colors cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="p-5 space-y-4">
+          <p className="text-xs text-slate-300 leading-relaxed">
+            {isDeleteConversation
+              ? `هل أنت متأكد من رغبتك في حذف محادثتك مع "${contact.name}"؟ لن يتم المساس بأي محادثات أخرى في حسابك.`
+              : `هل أنت متأكد من رغبتك في مسح جميع الرسائل داخل محادثتك مع "${contact.name}"؟ ستبقى المحادثة مفتوحة ولكن سيتم تفريغ الرسائل.`}
+          </p>
+
+          <div className="space-y-2">
+            <label className="block text-xs font-bold text-slate-300">
+              نطاق الحذف:
+            </label>
+
+            <button
+              type="button"
+              onClick={() => setScope('me')}
+              className={`w-full p-3 rounded-2xl border text-right transition-all flex items-start gap-3 cursor-pointer ${
+                scope === 'me'
+                  ? 'bg-emerald-500/15 border-emerald-500/50 text-white'
+                  : 'bg-slate-800/60 border-white/10 text-slate-300 hover:bg-slate-800'
+              }`}
+            >
+              <div
+                className={`w-5 h-5 rounded-full border flex items-center justify-center shrink-0 mt-0.5 ${
+                  scope === 'me'
+                    ? 'border-emerald-400 bg-emerald-500 text-slate-950'
+                    : 'border-slate-500'
+                }`}
+              >
+                {scope === 'me' && <Check className="w-3 h-3 stroke-[3]" />}
+              </div>
+              <div className="text-xs">
+                <p className="font-bold text-white">
+                  {isDeleteConversation
+                    ? 'حذف من جهتي فقط (حسابي الحالي فقط)'
+                    : 'مسح الرسائل من جهتي فقط (حسابي الحالي فقط)'}
+                </p>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  تُحذف الرسائل من شاشتك وسجلك الخاص فقط، وتظل ظاهرة لدى الطرف الآخر.
+                </p>
+              </div>
+            </button>
+
+            {!contact.isGroup && (
+              <button
+                type="button"
+                onClick={() => setScope('both')}
+                className={`w-full p-3 rounded-2xl border text-right transition-all flex items-start gap-3 cursor-pointer ${
+                  scope === 'both'
+                    ? 'bg-rose-500/15 border-rose-500/50 text-white'
+                    : 'bg-slate-800/60 border-white/10 text-slate-300 hover:bg-slate-800'
+                }`}
+              >
+                <div
+                  className={`w-5 h-5 rounded-full border flex items-center justify-center shrink-0 mt-0.5 ${
+                    scope === 'both'
+                      ? 'border-rose-400 bg-rose-500 text-white'
+                      : 'border-slate-500'
+                  }`}
+                >
+                  {scope === 'both' && <Check className="w-3 h-3 stroke-[3]" />}
+                </div>
+                <div className="text-xs">
+                  <p className="font-bold text-rose-200">
+                    {isDeleteConversation
+                      ? 'حذف المحادثة ومسح الرسائل لدى الطرفين'
+                      : 'مسح الرسائل لدى الطرفين (أنت والطرف الآخر)'}
+                  </p>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    يتم حذف الرسائل من غرفة المحادثة المشتركة في قاعدة بيانات Firestore للطرفين معاً.
+                  </p>
+                </div>
+              </button>
+            )}
+          </div>
+
+          <div className="flex items-center gap-2.5 pt-2">
+            <button
+              type="button"
+              disabled={isProcessing}
+              onClick={() => onConfirm(scope)}
+              className="flex-1 py-3 rounded-xl bg-rose-500 hover:bg-rose-400 disabled:opacity-50 text-white font-bold text-xs flex items-center justify-center gap-2 transition-all cursor-pointer shadow-lg shadow-rose-500/25"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span>
+                {isProcessing
+                  ? 'جاري التنفيذ...'
+                  : isDeleteConversation
+                  ? 'تأكيد حذف المحادثة'
+                  : 'تأكيد مسح المحادثة'}
+              </span>
+            </button>
+            <button
+              type="button"
+              disabled={isProcessing}
+              onClick={onClose}
+              className="px-5 py-3 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 font-bold text-xs transition-all cursor-pointer border border-white/10"
+            >
+              إلغاء
+            </button>
+          </div>
+        </div>
       </div>
     </div>
   );
