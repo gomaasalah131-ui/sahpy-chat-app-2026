@@ -11,10 +11,6 @@ import {
   applyActionCode,
   updateProfile,
   onAuthStateChanged,
-  RecaptchaVerifier,
-  linkWithPhoneNumber,
-  signInWithPhoneNumber,
-  ConfirmationResult,
   User,
 } from 'firebase/auth';
 import {
@@ -41,7 +37,7 @@ export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
 
 export { onAuthStateChanged };
-export type { User, ConfirmationResult };
+export type { User };
 
 export enum OperationType {
   CREATE = 'create',
@@ -130,11 +126,39 @@ export function sanitizeUsername(rawUsername: string): string {
   return cleaned;
 }
 
-export function sanitizePhoneTag(rawPhone: string): string {
-  const digits = String(rawPhone || '')
-    .replace(/[^0-9+]/g, '')
-    .slice(0, 20);
-  return digits.length >= 7 ? digits : '+201000000000';
+export const UNSET_PHONE_TAG = '+0000000';
+
+export function isUnsetPhoneTag(rawPhone?: string | null): boolean {
+  const cleaned = String(rawPhone || '').trim();
+  return (
+    !cleaned ||
+    cleaned === UNSET_PHONE_TAG ||
+    cleaned === '+201000000000' ||
+    cleaned === '0000000' ||
+    cleaned === 'none'
+  );
+}
+
+export function formatDisplayPhone(rawPhone?: string | null): string {
+  if (isUnsetPhoneTag(rawPhone)) return '';
+  return String(rawPhone || '').trim();
+}
+
+export function toAsciiDigits(input: string): string {
+  return String(input || '')
+    .replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
+    .replace(/[۰-۹]/g, (d) => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d)));
+}
+
+export function sanitizePhoneTag(rawPhone?: string | null): string {
+  if (isUnsetPhoneTag(rawPhone)) return UNSET_PHONE_TAG;
+  const ascii = toAsciiDigits(String(rawPhone || '').trim());
+  const normalized = normalizePhoneToE164(ascii, '+20');
+  if (normalized.valid && normalized.e164) {
+    return normalized.e164.slice(0, 20);
+  }
+  const digits = ascii.replace(/[^0-9+]/g, '').slice(0, 20);
+  return digits.length >= 7 ? digits : UNSET_PHONE_TAG;
 }
 
 export function isValidEmailFormat(email: string): boolean {
@@ -219,36 +243,211 @@ export function isValidUsernameFormat(username: string): boolean {
   return /^[a-z0-9_]{3,30}$/.test(clean);
 }
 
-export function isValidPhoneE164Format(countryCode: string, localDigits: string): {
+const KNOWN_COUNTRY_CODES = [
+  '20',
+  '966',
+  '971',
+  '965',
+  '974',
+  '973',
+  '968',
+  '962',
+  '961',
+  '964',
+  '212',
+  '213',
+  '216',
+  '218',
+  '249',
+  '967',
+  '970',
+  '963',
+  '90',
+  '49',
+  '44',
+  '1',
+];
+
+/**
+ * Unifies and normalizes a phone number with country code into canonical E.164 format (+[country][subscriber]).
+ * Handles:
+ * - Optional empty input (valid when optional=true)
+ * - Arabic/Persian digits
+ * - International '00' prefix (e.g. 002010... -> +2010...)
+ * - Leading '+' with trunk zero (e.g. +20010... -> +2010...)
+ * - Local number with selected country code (e.g. countryCode='+20', localDigits='01098765432' -> '+201098765432')
+ */
+export function normalizePhoneToE164(
+  rawInput: string,
+  defaultCountryCode = '+20',
+  options?: { allowEmpty?: boolean; optional?: boolean }
+): {
   valid: boolean;
+  isEmpty: boolean;
   e164: string;
   reason?: string;
 } {
-  const cleanCode = String(countryCode || '+20').replace(/[^0-9+]/g, '');
-  const normalizedDigits = String(localDigits || '')
-    .replace(/[٠-٩]/g, (d) => String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
-    .replace(/[۰-۹]/g, (d) => String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d)))
-    .replace(/\D/g, '')
-    .replace(/^0+/, '');
+  const asciiInput = toAsciiDigits(String(rawInput || '').trim());
+  const stripped = asciiInput.replace(/[\s\-().]/g, '');
 
-  if (normalizedDigits.length < 7 || normalizedDigits.length > 14) {
+  if (!stripped) {
+    if (options?.allowEmpty || options?.optional) {
+      return { valid: true, isEmpty: true, e164: '' };
+    }
     return {
       valid: false,
-      e164: `${cleanCode}${normalizedDigits}`,
-      reason: 'يرجى إدخال رقم هاتف صحيح (من 7 إلى 14 رقماً بدون الصفر الابتدائي).',
+      isEmpty: true,
+      e164: '',
+      reason: 'يرجى إدخال رقم الهاتف.',
     };
   }
 
-  const e164 = `${cleanCode.startsWith('+') ? cleanCode : `+${cleanCode}`}${normalizedDigits}`;
-  if (!/^\+[1-9]\d{7,14}$/.test(e164)) {
+  const cleanDefaultCode =
+    toAsciiDigits(String(defaultCountryCode || '+20')).replace(/\D/g, '') || '20';
+
+  let candidateDigits = '';
+
+  if (stripped.startsWith('+')) {
+    candidateDigits = stripped.slice(1).replace(/\D/g, '');
+  } else if (stripped.startsWith('00')) {
+    candidateDigits = stripped.slice(2).replace(/\D/g, '');
+  } else {
+    const onlyDigits = stripped.replace(/\D/g, '');
+    // Check if the user already typed the country code at the start of a long number
+    const matchedCode = KNOWN_COUNTRY_CODES.find(
+      (cc) =>
+        onlyDigits.startsWith(cc) &&
+        onlyDigits.length - cc.length >= 8 &&
+        !onlyDigits.startsWith('0')
+    );
+    if (matchedCode) {
+      candidateDigits = onlyDigits;
+    } else {
+      const localNoZero = onlyDigits.replace(/^0+/, '');
+      candidateDigits = `${cleanDefaultCode}${localNoZero}`;
+    }
+  }
+
+  // Strip accidental trunk '0' right after known country code (e.g. +2001012345678 -> +201012345678)
+  for (const cc of KNOWN_COUNTRY_CODES) {
+    if (
+      candidateDigits.startsWith(`${cc}0`) &&
+      candidateDigits.length - cc.length - 1 >= 7
+    ) {
+      candidateDigits = `${cc}${candidateDigits.slice(cc.length + 1).replace(/^0+/, '')}`;
+      break;
+    }
+  }
+
+  const e164 = `+${candidateDigits}`;
+  if (!/^\+[1-9]\d{6,14}$/.test(e164)) {
     return {
       valid: false,
+      isEmpty: false,
       e164,
-      reason: 'صيغة رقم الهاتف الدولية (E.164) غير صالحة. تأكد من رمز الدولة والرقم.',
+      reason:
+        'يرجى إدخال رقم هاتف صحيح مع رمز الدولة (من 7 إلى 15 رقماً، أو اتركه فارغاً لأنه اختياري).',
     };
   }
 
-  return { valid: true, e164 };
+  return { valid: true, isEmpty: false, e164 };
+}
+
+export function isValidPhoneE164Format(
+  countryCode: string,
+  localDigits: string,
+  options?: { allowEmpty?: boolean; optional?: boolean }
+): {
+  valid: boolean;
+  isEmpty?: boolean;
+  e164: string;
+  reason?: string;
+} {
+  return normalizePhoneToE164(localDigits, countryCode, options);
+}
+
+/**
+ * Splits a full E.164 or raw phone string into { countryCode, localDigits } for editing in profile forms.
+ */
+export function splitPhoneIntoCountryAndLocal(
+  rawPhone?: string | null,
+  fallbackCountryCode = '+20'
+): {
+  countryCode: string;
+  localDigits: string;
+} {
+  if (isUnsetPhoneTag(rawPhone)) {
+    return { countryCode: fallbackCountryCode, localDigits: '' };
+  }
+  const ascii = toAsciiDigits(String(rawPhone || '').trim()).replace(/[\s\-().]/g, '');
+  if (!ascii) {
+    return { countryCode: fallbackCountryCode, localDigits: '' };
+  }
+  const withoutPlus = ascii.startsWith('+')
+    ? ascii.slice(1)
+    : ascii.startsWith('00')
+    ? ascii.slice(2)
+    : ascii;
+
+  // Sort known country codes by length descending so 3-digit codes match before 1-digit codes
+  const sortedCodes = [...KNOWN_COUNTRY_CODES].sort((a, b) => b.length - a.length);
+  for (const cc of sortedCodes) {
+    if (withoutPlus.startsWith(cc) && withoutPlus.length > cc.length) {
+      return {
+        countryCode: `+${cc}`,
+        localDigits: withoutPlus.slice(cc.length),
+      };
+    }
+  }
+
+  return {
+    countryCode: fallbackCountryCode,
+    localDigits: withoutPlus.replace(/^0+/, ''),
+  };
+}
+
+/**
+ * Generates normalized E.164 lookup candidates from a raw phone search query
+ * so users can find contacts whether they search with '+2010...', '002010...', '2010...', or '010...'.
+ */
+export function buildNormalizedPhoneSearchCandidates(
+  rawQuery: string,
+  preferredCountryCode = '+20'
+): string[] {
+  const ascii = toAsciiDigits(String(rawQuery || '').trim());
+  // Only treat as phone search if input has at least 7 digits and no letters
+  if (/[a-zA-Z\u0600-\u06FF]/.test(ascii)) {
+    return [];
+  }
+  const digitsOnly = ascii.replace(/\D/g, '');
+  if (digitsOnly.length < 7 || digitsOnly.length > 16) {
+    return [];
+  }
+
+  const candidates = new Set<string>();
+
+  const primary = normalizePhoneToE164(ascii, preferredCountryCode);
+  if (primary.valid && primary.e164) {
+    candidates.add(primary.e164);
+  }
+
+  // If user typed a full international number without '+'
+  if (!digitsOnly.startsWith('0') && digitsOnly.length >= 9 && digitsOnly.length <= 15) {
+    candidates.add(`+${digitsOnly}`);
+  }
+
+  // If user typed a local number starting with 0 (e.g. 010... or 05...), also test common regional country codes
+  const localPart = digitsOnly.replace(/^0+/, '');
+  if (localPart.length >= 7 && localPart.length <= 11) {
+    for (const cc of ['20', '966', '971', '965', '974', '962', '964', '212', '1']) {
+      const cand = `+${cc}${localPart}`;
+      if (/^\+[1-9]\d{6,14}$/.test(cand)) {
+        candidates.add(cand);
+      }
+    }
+  }
+
+  return Array.from(candidates).slice(0, 4);
 }
 
 export function translateFirebaseAuthError(error: unknown): string {
@@ -260,8 +459,8 @@ export function translateFirebaseAuthError(error: unknown): string {
       ? window.location.hostname
       : 'current-domain';
 
-  if (rawMsg.includes('OTP_REQUEST_IN_FLIGHT')) {
-    return 'يوجد طلب إرسال رمز SMS قيد التنفيذ حالياً. يرجى الانتظار حتى يكتمل الطلب الحالي.';
+  if (rawMsg.includes('SEARCH_RATE_LIMITED')) {
+    return 'تم تجاوز الحد المسموح لمحاولات البحث المتتالية لحماية خصوصية المستخدمين. يرجى الانتظار بضع ثوانٍ ثم المحاولة مجدداً.';
   }
   if (rawMsg.includes('USERNAME_TAKEN')) {
     return 'اسم المستخدم (Username) محجوز ومستخدم بالفعل من قبل حساب آخر. يرجى اختيار اسم مستخدم فريد.';
@@ -372,158 +571,26 @@ export function translateFirebaseAuthError(error: unknown): string {
     : rawMsg || 'حدث خطأ غير متوقع أثناء الاتصال بـ Firebase. يرجى المحاولة مرة أخرى.';
 }
 
-export interface FirebasePhoneAuthDiagnostics {
-  projectId: string;
-  authDomain: string;
-  currentHostname: string;
-  authorizedDomains: string[];
-  isCurrentDomainAuthorized: boolean;
-  recaptchaEnterpriseConfigured: boolean;
-  recaptchaV2SiteKeyPresent: boolean;
-  identityToolkitApiEnabled: boolean;
-  secureTokenApiEnabled: boolean;
-  secureTokenApiStatusDetail: string;
-  phoneAuthProbeStatus: 'unknown' | 'operation_not_allowed' | 'ready_or_requires_token' | 'error';
-  phoneAuthProbeDetail: string;
-}
-
-/**
- * Inspects live Firebase Identity Toolkit configuration, Secure Token API status,
- * & Authorized Domains for the current project without disabling reCAPTCHA or exposing secrets.
- */
-export async function inspectFirebasePhoneAuthEnvironment(): Promise<FirebasePhoneAuthDiagnostics> {
-  const currentHostname =
-    typeof window !== 'undefined' && window.location?.hostname
-      ? window.location.hostname
-      : 'localhost';
-  const apiKey = firebaseConfig.apiKey;
-  let authorizedDomains: string[] = [];
-  let recaptchaEnterpriseConfigured = false;
-  let recaptchaV2SiteKeyPresent = false;
-  let identityToolkitApiEnabled = false;
-  let secureTokenApiEnabled = true;
-  let secureTokenApiStatusDetail = '';
-  let phoneAuthProbeStatus: FirebasePhoneAuthDiagnostics['phoneAuthProbeStatus'] =
-    'unknown';
-  let phoneAuthProbeDetail = '';
-
-  try {
-    const projRes = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/projects?key=${encodeURIComponent(apiKey)}`
-    );
-    if (projRes.ok) {
-      identityToolkitApiEnabled = true;
-      const projData = await projRes.json();
-      if (Array.isArray(projData.authorizedDomains)) {
-        authorizedDomains = projData.authorizedDomains;
-      }
-    }
-  } catch {
-    // ignore network error during diagnostics
-  }
-
-  try {
-    const stRes = await fetch(
-      `https://securetoken.googleapis.com/v1/token?key=${encodeURIComponent(apiKey)}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: 'grant_type=refresh_token&refresh_token=probe_check',
-      }
-    );
-    if (stRes.status === 403) {
-      const stErr = await stRes.json().catch(() => ({}));
-      const msg = String(stErr?.error?.message || '');
-      if (
-        msg.includes('Token Service API has not been used') ||
-        msg.includes('securetoken.googleapis.com')
-      ) {
-        secureTokenApiEnabled = false;
-        secureTokenApiStatusDetail =
-          'Secure Token API (securetoken.googleapis.com) معطّلة في مشروع AI Studio Starter Tier (892622995916) بسبب قيود صلاحيات Google Cloud IAM (Missing required permission: serviceusage.services.enable). يعمل التطبيق الآن عبر Identity Toolkit API مباشرة دون استدعاء Secure Token API.';
-      }
-    }
-  } catch {
-    // ignore network error during diagnostics
-  }
-
-  try {
-    const entRes = await fetch(
-      `https://identitytoolkit.googleapis.com/v2/recaptchaConfig?key=${encodeURIComponent(apiKey)}&clientType=CLIENT_TYPE_WEB&version=RECAPTCHA_ENTERPRISE`
-    );
-    if (entRes.ok) {
-      const entData = await entRes.json();
-      recaptchaEnterpriseConfigured = Boolean(
-        entData.recaptchaKey ||
-          entData.useSmsBotScore ||
-          entData.useSmsTollFraudProtection
-      );
-    }
-  } catch {
-    // ignore
-  }
-
-  try {
-    const v2Res = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/recaptchaParams?key=${encodeURIComponent(apiKey)}`
-    );
-    if (v2Res.ok) {
-      const v2Data = await v2Res.json();
-      recaptchaV2SiteKeyPresent = Boolean(v2Data.recaptchaSiteKey);
-    }
-  } catch {
-    // ignore
-  }
-
-  const isCurrentDomainAuthorized =
-    authorizedDomains.length === 0
-      ? true
-      : authorizedDomains.some(
-          (d) =>
-            d.toLowerCase() === currentHostname.toLowerCase() ||
-            currentHostname.toLowerCase().endsWith(`.${d.toLowerCase()}`)
-        );
-
-  if (!recaptchaEnterpriseConfigured && recaptchaV2SiteKeyPresent) {
-    phoneAuthProbeDetail =
-      'ملاحظة: رسالة "Failed to initialize reCAPTCHA Enterprise config. Triggering the reCAPTCHA v2 verification." هي تنبيه طبيعي من حزمة Firebase لأن المشروع يستخدم reCAPTCHA v2 القياسي (المجاني) بدلاً من reCAPTCHA Enterprise المدفوع.';
-  }
-
-  return {
-    projectId: firebaseConfig.projectId,
-    authDomain: firebaseConfig.authDomain,
-    currentHostname,
-    authorizedDomains,
-    isCurrentDomainAuthorized,
-    recaptchaEnterpriseConfigured,
-    recaptchaV2SiteKeyPresent,
-    identityToolkitApiEnabled,
-    secureTokenApiEnabled,
-    secureTokenApiStatusDetail,
-    phoneAuthProbeStatus,
-    phoneAuthProbeDetail,
-  };
-}
-
 // ============================================================================
 // 1. REAL FIREBASE AUTHENTICATION OPERATIONS
 // ============================================================================
 
-// Ephemeral credentials for the current browser tab session only (stored in memory + sessionStorage, cleared on sign-out)
+// Session credentials stored for the active signed-in session (cleared immediately on sign-out).
 // Used strictly as a fallback when Secure Token API (securetoken.googleapis.com) is disabled
-// in Starter Tier projects so Identity Toolkit API can mint a fresh idToken after email verification or token expiry.
+// in Starter Tier projects so Identity Toolkit API can mint a fresh idToken across tabs or after 1 hour.
 let ephemeralSessionAuth: { email: string; password: string } | null = null;
 const EPHEMERAL_SESSION_KEY = 'sahpy_ephemeral_reauth_v1';
 
 function saveEphemeralSessionAuth(email: string, password: string): void {
   const cleanEmail = email.trim().toLowerCase();
   ephemeralSessionAuth = { email: cleanEmail, password };
+  const serialized = JSON.stringify({ email: cleanEmail, password });
   try {
     if (typeof sessionStorage !== 'undefined') {
-      sessionStorage.setItem(
-        EPHEMERAL_SESSION_KEY,
-        JSON.stringify({ email: cleanEmail, password })
-      );
+      sessionStorage.setItem(EPHEMERAL_SESSION_KEY, serialized);
+    }
+    if (typeof localStorage !== 'undefined') {
+      localStorage.setItem(EPHEMERAL_SESSION_KEY, serialized);
     }
   } catch {
     // ignore storage errors
@@ -533,17 +600,19 @@ function saveEphemeralSessionAuth(email: string, password: string): void {
 function getEphemeralSessionAuth(): { email: string; password: string } | null {
   if (ephemeralSessionAuth) return ephemeralSessionAuth;
   try {
-    if (typeof sessionStorage !== 'undefined') {
-      const raw = sessionStorage.getItem(EPHEMERAL_SESSION_KEY);
-      if (raw) {
-        const parsed = JSON.parse(raw);
-        if (parsed?.email && parsed?.password) {
-          ephemeralSessionAuth = {
-            email: String(parsed.email),
-            password: String(parsed.password),
-          };
-          return ephemeralSessionAuth;
-        }
+    const raw =
+      (typeof sessionStorage !== 'undefined' &&
+        sessionStorage.getItem(EPHEMERAL_SESSION_KEY)) ||
+      (typeof localStorage !== 'undefined' &&
+        localStorage.getItem(EPHEMERAL_SESSION_KEY));
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (parsed?.email && parsed?.password) {
+        ephemeralSessionAuth = {
+          email: String(parsed.email),
+          password: String(parsed.password),
+        };
+        return ephemeralSessionAuth;
       }
     }
   } catch {
@@ -557,6 +626,9 @@ function clearEphemeralSessionAuth(): void {
   try {
     if (typeof sessionStorage !== 'undefined') {
       sessionStorage.removeItem(EPHEMERAL_SESSION_KEY);
+    }
+    if (typeof localStorage !== 'undefined') {
+      localStorage.removeItem(EPHEMERAL_SESSION_KEY);
     }
   } catch {
     // ignore storage errors
@@ -829,17 +901,14 @@ export async function ensureValidAuthTokenForFirestore(options?: {
           creds.email,
           creds.password
         );
-        const refreshedToken = await reauthed.user.getIdToken(false);
-        const refreshedPayload = decodeJwtPayload(refreshedToken);
-        if (mustHaveVerifiedClaim && refreshedPayload?.email_verified !== true) {
-          return false;
-        }
-        return true;
+        await reauthed.user.getIdToken(false);
+        return Boolean(!mustHaveVerifiedClaim || reauthed.user.emailVerified);
       } catch {
-        if (mustHaveVerifiedClaim) return false;
+        // If reauth failed, rely on Identity Toolkit's verified email status if token is valid
+        return Boolean(!mustHaveVerifiedClaim || auth.currentUser?.emailVerified);
       }
     } else if (mustHaveVerifiedClaim) {
-      return false;
+      return Boolean(auth.currentUser?.emailVerified);
     }
   }
 
@@ -978,250 +1047,8 @@ export async function reloadAndCheckCurrentUser(): Promise<User | null> {
   return auth.currentUser;
 }
 
-let activeRecaptchaVerifier: RecaptchaVerifier | null = null;
-let activeRecaptchaWidgetId: number | null = null;
-let activeRecaptchaContainerId: string | null = null;
-let activeRecaptchaSize: 'invisible' | 'normal' | null = null;
-let isPhoneOtpRequestInFlight = false;
-
-export function clearRecaptchaVerifier(containerId?: string): void {
-  const targetId =
-    containerId || activeRecaptchaContainerId || 'firebase-recaptcha-container';
-
-  if (
-    activeRecaptchaWidgetId !== null &&
-    typeof window !== 'undefined' &&
-    (window as unknown as { grecaptcha?: { reset?: (id?: number) => void } })
-      .grecaptcha?.reset
-  ) {
-    try {
-      (
-        window as unknown as { grecaptcha: { reset: (id?: number) => void } }
-      ).grecaptcha.reset(activeRecaptchaWidgetId);
-    } catch {
-      // ignore grecaptcha reset error
-    }
-  }
-
-  if (activeRecaptchaVerifier) {
-    try {
-      activeRecaptchaVerifier.clear();
-    } catch {
-      // ignore cleanup error
-    }
-    activeRecaptchaVerifier = null;
-  }
-
-  activeRecaptchaWidgetId = null;
-  activeRecaptchaSize = null;
-
-  if (typeof document !== 'undefined') {
-    const outerContainer = document.getElementById(targetId);
-    if (outerContainer) {
-      outerContainer.innerHTML = '';
-    }
-  }
-}
-
-/**
- * Resets an existing reCAPTCHA v2 widget if possible, or clears and rebuilds it cleanly.
- */
-export function resetRecaptchaVerifier(containerId?: string): void {
-  clearRecaptchaVerifier(containerId);
-}
-
-/**
- * Initializes (or reuses) a real Firebase RecaptchaVerifier (v2 fallback supported)
- * inside a clean mount element so repeated attempts never collide with stale DOM state.
- * Never disables reCAPTCHA in production.
- */
-export async function ensureRecaptchaVerifier(
-  recaptchaContainerId: string,
-  size: 'invisible' | 'normal' = 'invisible',
-  callbacks?: {
-    onSolved?: () => void;
-    onExpired?: () => void;
-    onError?: (err: unknown) => void;
-  }
-): Promise<RecaptchaVerifier> {
-  if (typeof document === 'undefined') {
-    throw new Error('بيئة المتصفح غير متاحة لتهيئة reCAPTCHA.');
-  }
-
-  const outerContainer = document.getElementById(recaptchaContainerId);
-  if (!outerContainer) {
-    throw new Error(
-      `لم يتم العثور على عنصر حاوية reCAPTCHA (#${recaptchaContainerId}) في الصفحة.`
-    );
-  }
-
-  // If we already have an active verifier with the same container and size, reset its widget and reuse it
-  if (
-    activeRecaptchaVerifier &&
-    activeRecaptchaContainerId === recaptchaContainerId &&
-    activeRecaptchaSize === size &&
-    activeRecaptchaWidgetId !== null &&
-    outerContainer.childElementCount > 0
-  ) {
-    try {
-      const grecaptchaObj = (
-        window as unknown as { grecaptcha?: { reset?: (id?: number) => void } }
-      ).grecaptcha;
-      if (grecaptchaObj?.reset) {
-        grecaptchaObj.reset(activeRecaptchaWidgetId);
-        return activeRecaptchaVerifier;
-      }
-    } catch {
-      // If resetting the existing widget fails, fall through and recreate cleanly
-    }
-  }
-
-  clearRecaptchaVerifier(recaptchaContainerId);
-
-  // Create a fresh inner mount node inside outerContainer to prevent
-  // "reCAPTCHA has already been rendered in this element" errors on retries
-  const mountNode = document.createElement('div');
-  mountNode.id = `${recaptchaContainerId}-widget-${Date.now()}`;
-  outerContainer.innerHTML = '';
-  outerContainer.appendChild(mountNode);
-
-  activeRecaptchaContainerId = recaptchaContainerId;
-  activeRecaptchaSize = size;
-
-  activeRecaptchaVerifier = new RecaptchaVerifier(auth, mountNode, {
-    size,
-    callback: () => {
-      callbacks?.onSolved?.();
-    },
-    'expired-callback': () => {
-      callbacks?.onExpired?.();
-      clearRecaptchaVerifier(recaptchaContainerId);
-    },
-    'error-callback': (err: unknown) => {
-      callbacks?.onError?.(err);
-      clearRecaptchaVerifier(recaptchaContainerId);
-    },
-  });
-
-  activeRecaptchaWidgetId = await activeRecaptchaVerifier.render();
-  return activeRecaptchaVerifier;
-}
-
-export async function sendPhoneOtpViaFirebase(
-  phoneE164: string,
-  recaptchaContainerId: string,
-  options?: {
-    recaptchaSize?: 'invisible' | 'normal';
-    preferSignInWithPhoneNumber?: boolean;
-  }
-): Promise<ConfirmationResult> {
-  if (isPhoneOtpRequestInFlight) {
-    throw new Error('OTP_REQUEST_IN_FLIGHT');
-  }
-
-  const cleanPhone = String(phoneE164 || '').trim();
-  if (!/^\+[1-9]\d{7,14}$/.test(cleanPhone)) {
-    throw {
-      code: 'auth/invalid-phone-number',
-      message: 'Invalid E.164 phone number format.',
-    };
-  }
-
-  isPhoneOtpRequestInFlight = true;
-  const size = options?.recaptchaSize || 'invisible';
-
-  try {
-    const verifier = await ensureRecaptchaVerifier(recaptchaContainerId, size);
-
-    let confirmationResult: ConfirmationResult;
-
-    if (
-      auth.currentUser &&
-      !auth.currentUser.phoneNumber &&
-      !options?.preferSignInWithPhoneNumber
-    ) {
-      try {
-        confirmationResult = await linkWithPhoneNumber(
-          auth.currentUser,
-          cleanPhone,
-          verifier
-        );
-      } catch (linkErr) {
-        const errCode = (linkErr as { code?: string })?.code || '';
-        // If current user already has a phone provider linked OR if linkWithPhoneNumber
-        // tried to call the disabled Secure Token API (securetoken.googleapis.com) on an
-        // expired session token, fall back to signInWithPhoneNumber which uses Identity Toolkit directly!
-        if (
-          errCode.includes('auth/provider-already-linked') ||
-          isTokenServiceDisabledError(linkErr)
-        ) {
-          const freshVerifier = await ensureRecaptchaVerifier(
-            recaptchaContainerId,
-            size
-          );
-          confirmationResult = await signInWithPhoneNumber(
-            auth,
-            cleanPhone,
-            freshVerifier
-          );
-        } else {
-          throw linkErr;
-        }
-      }
-    } else {
-      confirmationResult = await signInWithPhoneNumber(
-        auth,
-        cleanPhone,
-        verifier
-      );
-    }
-
-    if (!confirmationResult || !confirmationResult.verificationId) {
-      throw new Error(
-        'لم يُرجع Firebase معرّف التحقق (verificationId) بعد طلب إرسال SMS.'
-      );
-    }
-
-    return confirmationResult;
-  } catch (error) {
-    // Always reset/clear reCAPTCHA whenever the SMS OTP request fails so subsequent attempts don't hang
-    resetRecaptchaVerifier(recaptchaContainerId);
-    throw error;
-  } finally {
-    isPhoneOtpRequestInFlight = false;
-  }
-}
-
-export async function confirmPhoneOtpViaFirebase(
-  confirmationResult: ConfirmationResult,
-  otpCode: string
-): Promise<User> {
-  const cleanCode = String(otpCode || '').trim();
-  if (!/^\d{6}$/.test(cleanCode)) {
-    throw { code: 'auth/invalid-verification-code' };
-  }
-  const result = await confirmationResult.confirm(cleanCode);
-  patchFirebaseUserTokenManager(result.user);
-  // IMPORTANT: Do NOT call getIdToken(true) here because confirmationResult.confirm()
-  // already returns a brand-new idToken from identitytoolkit.googleapis.com, whereas
-  // getIdToken(true) forces a call to securetoken.googleapis.com which is disabled in
-  // Google AI Studio Starter Tier projects (892622995916).
-  if (auth.currentUser) {
-    try {
-      await auth.currentUser.reload();
-    } catch (reloadErr) {
-      if (!isTokenServiceDisabledError(reloadErr)) {
-        throw reloadErr;
-      }
-    }
-  }
-  clearRecaptchaVerifier();
-  return result.user;
-}
-
 export async function signOutFromCloud(): Promise<void> {
   clearEphemeralSessionAuth();
-  clearRecaptchaVerifier();
   await signOut(auth);
 }
 
@@ -1360,9 +1187,9 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
     .slice(0, 120);
   const safeEmail =
     rawEmail.length >= 5 ? rawEmail : `${cleanUsername}@sahpy.chat`.slice(0, 120);
-  const safePhone = sanitizePhoneTag(
-    auth.currentUser.phoneNumber || params.user.phoneNumber || params.phoneTag
-  );
+  const safePhone = sanitizePhoneTag(params.phoneTag);
+  const hasSearchablePhone =
+    !isUnsetPhoneTag(safePhone) && /^\+[1-9]\d{6,18}$/.test(safePhone);
   const safeBio = (params.bio || 'متاح للمحادثة عبر SAHPY-CHAT ✨')
     .trim()
     .slice(0, 200);
@@ -1371,12 +1198,12 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
     40
   );
   const emailVerified = Boolean(auth.currentUser.emailVerified || params.user.emailVerified);
-  const phoneVerified = Boolean(
-    params.phoneVerified || auth.currentUser.phoneNumber || params.user.phoneNumber
-  );
+  // Phone number is a regular profile field for search only (never marked verified via SMS)
+  const phoneVerified = false;
 
   const userRef = doc(db, 'users', uid);
   const dirRef = doc(db, 'directory', uid);
+  let previousPhoneTag = '';
 
   // If a legacy user document exists from an older schema (missing uid/createdAt/wallpaperTheme),
   // clean it up first so the transaction creates a strictly compliant UserProfile document.
@@ -1384,6 +1211,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
     const existingUserSnap = await getDoc(userRef);
     if (existingUserSnap.exists()) {
       const uData = existingUserSnap.data();
+      previousPhoneTag = String(uData.phoneTag || uData.phone || '').trim();
       const hasLegacyShape =
         !uData.uid ||
         !uData.username ||
@@ -1512,6 +1340,49 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
     handleFirestoreError(error, OperationType.WRITE, `users/${uid}`);
   }
 
+  // Sync non-PII phone search index (/phone_index/{phoneKey}) for phone lookup without exposing PII
+  try {
+    if (
+      previousPhoneTag &&
+      previousPhoneTag !== safePhone &&
+      /^\+[1-9]\d{6,18}$/.test(previousPhoneTag) &&
+      !isUnsetPhoneTag(previousPhoneTag)
+    ) {
+      const oldPhoneRef = doc(db, 'phone_index', previousPhoneTag);
+      const oldPhoneSnap = await getDoc(oldPhoneRef);
+      if (oldPhoneSnap.exists() && oldPhoneSnap.data().uid === uid) {
+        await deleteDoc(oldPhoneRef);
+      }
+    }
+
+    if (hasSearchablePhone) {
+      const phoneRef = doc(db, 'phone_index', safePhone);
+      const phoneSnap = await getDoc(phoneRef);
+      if (!phoneSnap.exists()) {
+        await setDoc(phoneRef, {
+          uid,
+          phoneKey: safePhone,
+          username: resolvedUsername,
+          displayName: safeDisplayName,
+          bio: safeBio,
+          avatarFallbackColor: safeColor,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      } else if (phoneSnap.data().uid === uid) {
+        await updateDoc(phoneRef, {
+          username: resolvedUsername,
+          displayName: safeDisplayName,
+          bio: safeBio,
+          avatarFallbackColor: safeColor,
+          updatedAt: serverTimestamp(),
+        });
+      }
+    }
+  } catch {
+    // Non-fatal if another user already indexed the same unverified phone number
+  }
+
   cacheUsernameEmailMapping(resolvedUsername, safeEmail);
 
   return {
@@ -1519,11 +1390,11 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
     displayName: safeDisplayName,
     username: resolvedUsername,
     email: safeEmail,
-    phoneTag: safePhone,
+    phoneTag: formatDisplayPhone(safePhone),
     bio: safeBio,
     wallpaperTheme: params.wallpaperTheme,
     emailVerified,
-    phoneVerified,
+    phoneVerified: false,
   };
 }
 
@@ -1545,30 +1416,94 @@ export async function getOwnUserProfileFromFirestore(
       displayName: String(d.displayName || d.name || ''),
       username: String(d.username || ''),
       email: String(d.email || auth.currentUser?.email || ''),
-      phoneTag: String(d.phoneTag || d.phone || ''),
+      phoneTag: formatDisplayPhone(String(d.phoneTag || d.phone || '')),
       bio: String(d.bio || ''),
       wallpaperTheme: (d.wallpaperTheme as WallpaperThemeId) || 'aurora-borealis',
       emailVerified: Boolean(d.emailVerified ?? auth.currentUser?.emailVerified),
-      phoneVerified: Boolean(d.phoneVerified ?? auth.currentUser?.phoneNumber),
+      phoneVerified: false,
     };
   } catch (error) {
+    // If token expired right before getDoc in Starter Tier, attempt re-auth once before surfacing error
+    const creds = getEphemeralSessionAuth();
+    if (creds) {
+      try {
+        await signInWithEmailAndPassword(auth, creds.email, creds.password);
+        const retrySnap = await getDoc(doc(db, 'users', uid));
+        if (!retrySnap.exists()) return null;
+        const d = retrySnap.data();
+        return {
+          uid: String(d.uid || uid),
+          displayName: String(d.displayName || d.name || ''),
+          username: String(d.username || ''),
+          email: String(d.email || auth.currentUser?.email || ''),
+          phoneTag: formatDisplayPhone(String(d.phoneTag || d.phone || '')),
+          bio: String(d.bio || ''),
+          wallpaperTheme:
+            (d.wallpaperTheme as WallpaperThemeId) || 'aurora-borealis',
+          emailVerified: Boolean(
+            d.emailVerified ?? auth.currentUser?.emailVerified
+          ),
+          phoneVerified: false,
+        };
+      } catch {
+        // Fall through
+      }
+    }
     handleFirestoreError(error, OperationType.GET, path);
   }
 }
 
 // ============================================================================
-// 3. SEARCH REGISTERED USERS IN FIRESTORE BY @USERNAME OR UID
+// 3. SEARCH REGISTERED USERS IN FIRESTORE BY @USERNAME, PHONE NUMBER, OR UID
+//    (WITH RATE LIMITING & ZERO PII EXPOSURE)
 // ============================================================================
 
+const searchTimestampsMs: number[] = [];
+const MAX_SEARCHES_PER_MINUTE = 18;
+let lastSearchQueryCache: { query: string; result: PublicDirectoryUser | null; ts: number } | null = null;
+
+function checkClientSearchRateLimit(queryKey: string): boolean {
+  const now = Date.now();
+  if (
+    lastSearchQueryCache &&
+    lastSearchQueryCache.query === queryKey &&
+    now - lastSearchQueryCache.ts < 3000
+  ) {
+    return true;
+  }
+  while (searchTimestampsMs.length > 0 && now - searchTimestampsMs[0] > 60000) {
+    searchTimestampsMs.shift();
+  }
+  if (searchTimestampsMs.length >= MAX_SEARCHES_PER_MINUTE) {
+    return false;
+  }
+  searchTimestampsMs.push(now);
+  return true;
+}
+
 export async function findRegisteredUserInFirestore(
-  rawQuery: string
+  rawQuery: string,
+  preferredCountryCode = '+20'
 ): Promise<PublicDirectoryUser | null> {
   if (!auth.currentUser) return null;
   const hasValidToken = await ensureValidAuthTokenForFirestore();
   if (!hasValidToken || !auth.currentUser) return null;
 
   const trimmed = String(rawQuery || '').trim();
-  if (!trimmed) return null;
+  if (trimmed.length < 3) return null;
+
+  const cacheKey = `${trimmed.toLowerCase()}|${preferredCountryCode}`;
+  if (
+    lastSearchQueryCache &&
+    lastSearchQueryCache.query === cacheKey &&
+    Date.now() - lastSearchQueryCache.ts < 3000
+  ) {
+    return lastSearchQueryCache.result;
+  }
+
+  if (!checkClientSearchRateLimit(cacheKey)) {
+    throw new Error('SEARCH_RATE_LIMITED');
+  }
 
   // 1. Try lookup by exact @username in /usernames/{username}
   const candidateUsername = sanitizeUsername(trimmed);
@@ -1582,7 +1517,7 @@ export async function findRegisteredUserInFirestore(
           const dirSnap = await getDoc(doc(db, 'directory', targetUid));
           if (dirSnap.exists()) {
             const d = dirSnap.data();
-            return {
+            const found: PublicDirectoryUser = {
               uid: String(d.uid || targetUid),
               username: String(d.username || candidateUsername),
               displayName: String(d.displayName || candidateUsername),
@@ -1591,12 +1526,13 @@ export async function findRegisteredUserInFirestore(
                 d.avatarFallbackColor || 'bg-emerald-600'
               ),
               emailVerified: Boolean(d.emailVerified),
-              phoneVerified: Boolean(d.phoneVerified),
+              phoneVerified: false,
             };
+            lastSearchQueryCache = { query: cacheKey, result: found, ts: Date.now() };
+            return found;
           }
-          // Fallback to data from /usernames/{username} if /directory doc is being synced
           const uData = unameSnap.data();
-          return {
+          const found: PublicDirectoryUser = {
             uid: targetUid,
             username: String(uData.username || candidateUsername),
             displayName: String(uData.displayName || candidateUsername),
@@ -1607,6 +1543,8 @@ export async function findRegisteredUserInFirestore(
             emailVerified: true,
             phoneVerified: false,
           };
+          lastSearchQueryCache = { query: cacheKey, result: found, ts: Date.now() };
+          return found;
         }
       }
     } catch (error) {
@@ -1614,15 +1552,68 @@ export async function findRegisteredUserInFirestore(
     }
   }
 
-  // 2. Try lookup by exact Firebase Auth UID in /directory/{uid}
+  // 2. Try lookup by normalized phone number in /phone_index/{phoneKey}
+  const phoneCandidates = buildNormalizedPhoneSearchCandidates(
+    trimmed,
+    preferredCountryCode
+  );
+  for (const phoneKey of phoneCandidates) {
+    const phonePath = `phone_index/${phoneKey}`;
+    try {
+      const phoneSnap = await getDoc(doc(db, 'phone_index', phoneKey));
+      if (phoneSnap.exists()) {
+        const pData = phoneSnap.data();
+        const targetUid = String(pData.uid || '');
+        if (targetUid) {
+          const dirSnap = await getDoc(doc(db, 'directory', targetUid));
+          if (dirSnap.exists()) {
+            const d = dirSnap.data();
+            const found: PublicDirectoryUser = {
+              uid: String(d.uid || targetUid),
+              username: String(d.username || pData.username || ''),
+              displayName: String(d.displayName || pData.displayName || ''),
+              bio: String(d.bio || pData.bio || ''),
+              avatarFallbackColor: String(
+                d.avatarFallbackColor || pData.avatarFallbackColor || 'bg-emerald-600'
+              ),
+              emailVerified: Boolean(d.emailVerified),
+              phoneVerified: false,
+            };
+            lastSearchQueryCache = { query: cacheKey, result: found, ts: Date.now() };
+            return found;
+          }
+          const found: PublicDirectoryUser = {
+            uid: targetUid,
+            username: String(pData.username || ''),
+            displayName: String(pData.displayName || ''),
+            bio: String(pData.bio || ''),
+            avatarFallbackColor: String(
+              pData.avatarFallbackColor || 'bg-emerald-600'
+            ),
+            emailVerified: true,
+            phoneVerified: false,
+          };
+          lastSearchQueryCache = { query: cacheKey, result: found, ts: Date.now() };
+          return found;
+        }
+      }
+    } catch (error) {
+      handleFirestoreError(error, OperationType.GET, phonePath);
+    }
+  }
+
+  // 3. Try lookup by exact Firebase Auth UID in /directory/{uid}
   const candidateUid = trimmed.replace(/^@+/, '');
-  if (/^[a-zA-Z0-9_-]{6,128}$/.test(candidateUid)) {
+  if (
+    /^[a-zA-Z0-9_-]{6,128}$/.test(candidateUid) &&
+    phoneCandidates.length === 0
+  ) {
     const dirPath = `directory/${candidateUid}`;
     try {
       const dirSnap = await getDoc(doc(db, 'directory', candidateUid));
       if (dirSnap.exists()) {
         const d = dirSnap.data();
-        return {
+        const found: PublicDirectoryUser = {
           uid: String(d.uid || candidateUid),
           username: String(d.username || ''),
           displayName: String(d.displayName || ''),
@@ -1631,14 +1622,42 @@ export async function findRegisteredUserInFirestore(
             d.avatarFallbackColor || 'bg-emerald-600'
           ),
           emailVerified: Boolean(d.emailVerified),
-          phoneVerified: Boolean(d.phoneVerified),
+          phoneVerified: false,
         };
+        lastSearchQueryCache = { query: cacheKey, result: found, ts: Date.now() };
+        return found;
       }
     } catch (error) {
       handleFirestoreError(error, OperationType.GET, dirPath);
     }
   }
 
+  // 4. Fallback to backend privacy-preserving search endpoint (supports searching legacy profiles by normalized phone or username)
+  try {
+    const res = await fetch(
+      `/api/users/search?q=${encodeURIComponent(trimmed)}&cc=${encodeURIComponent(preferredCountryCode)}`
+    );
+    if (res.ok) {
+      const data = await res.json();
+      if (data?.user?.uid) {
+        const found: PublicDirectoryUser = {
+          uid: String(data.user.uid),
+          username: String(data.user.username || ''),
+          displayName: String(data.user.name || data.user.displayName || ''),
+          bio: String(data.user.bio || ''),
+          avatarFallbackColor: 'bg-emerald-600',
+          emailVerified: Boolean(data.user.emailVerified ?? true),
+          phoneVerified: false,
+        };
+        lastSearchQueryCache = { query: cacheKey, result: found, ts: Date.now() };
+        return found;
+      }
+    }
+  } catch {
+    // ignore backend fallback error
+  }
+
+  lastSearchQueryCache = { query: cacheKey, result: null, ts: Date.now() };
   return null;
 }
 
@@ -2421,7 +2440,7 @@ export async function syncUserToFirestore(user: {
     phoneTag: user.phone,
     bio: user.bio,
     wallpaperTheme: 'aurora-borealis',
-    phoneVerified: Boolean(user.phoneVerified || auth.currentUser.phoneNumber),
+    phoneVerified: false,
   }).catch(() => {});
 }
 

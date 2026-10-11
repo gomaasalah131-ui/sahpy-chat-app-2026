@@ -436,7 +436,7 @@ export default function App() {
     return raw.replace(/الديزينر انجينير\s*/g, '').trim() || '𝔼𝕟𝕘𝕚𝕟𝕖𝕖𝕣 𝕊𝔸𝕃𝔸ℍ 𝔾𝕆𝕄𝔸𝔸';
   });
   const [userPhone, setUserPhone] = useState(
-    () => localStorage.getItem('nabd_user_phone') || '+20 109 876 5432'
+    () => localStorage.getItem('nabd_user_phone') || ''
   );
   const [userUsername, setUserUsername] = useState(
     () => localStorage.getItem('nabd_user_username') || 'salah_gomaa'
@@ -731,7 +731,7 @@ export default function App() {
           const profile = await fetchUserProfileByUid(fbUser.uid);
           if (profile) {
             setUserName(profile.displayName || fbUser.displayName || userName);
-            if (profile.phoneTag) setUserPhone(profile.phoneTag);
+            setUserPhone(profile.phoneTag || '');
             if (profile.username) setUserUsername(profile.username);
             if (profile.bio) setUserBio(profile.bio);
             setFirestoreConnected(true);
@@ -1367,8 +1367,10 @@ export default function App() {
       syncUserToFirestore({
         name,
         phone,
+        username: cleanUser,
         bio,
         avatar: finalAvatar,
+        phoneVerified: false,
       });
     }
 

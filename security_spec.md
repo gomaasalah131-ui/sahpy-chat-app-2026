@@ -5,7 +5,7 @@
 1. **Global Default-Deny**: Any path not explicitly matched is unconditionally denied (`allow read, write: if false;`).
 2. **PII Isolation (Split Collection Pattern)**:
    - `/users/{userId}` stores private PII (`email`, `phoneTag`) and is strictly readable and writable ONLY by the owner (`request.auth.uid == userId`).
-   - `/directory/{userId}` and `/usernames/{username}` store ONLY non-PII public fields (`uid`, `username`, `displayName`, `bio`, `avatarFallbackColor`, `emailVerified`, `phoneVerified`) to allow safe lookup by exact UID or exact `@username` without exposing email or phone number.
+   - `/directory/{userId}`, `/usernames/{username}`, and `/phone_index/{phoneKey}` store ONLY non-PII public fields (`uid`, `username`, `displayName`, `bio`, `avatarFallbackColor`, `emailVerified`, `phoneVerified`) to allow safe point lookup by exact UID, exact `@username`, or normalized E.164 phone number without exposing email or phone number or allowing bulk account enumeration (`allow list` is restricted to `existing().uid == request.auth.uid`).
 3. **Atomic Unique Username Reservation**:
    - `/usernames/{username}` enforces `!exists(/databases/$(database)/documents/usernames/$(username))` on `create` and locks `uid` and `username` as immutable on `update`.
    - Creating `/users/{userId}` and `/directory/{userId}` requires `existsAfter(/databases/$(database)/documents/usernames/$(incoming().username))` and `getAfter(...).data.uid == request.auth.uid`.

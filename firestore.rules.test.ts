@@ -121,4 +121,12 @@ export const DIRTY_DOZEN_TESTS: SecurityPayloadTestCase[] = [
     expectedOutcome: 'PERMISSION_DENIED',
     payload: { text: 'x'.repeat(2500) },
   },
+  {
+    id: 13,
+    name: 'Unauthorized Phone Index Hijack by Non-Owner',
+    collectionPath: '/phone_index/+201094823190',
+    operation: 'update',
+    expectedOutcome: 'PERMISSION_DENIED',
+    payload: { uid: 'attacker_1', phoneKey: '+201094823190' },
+  },
 ];

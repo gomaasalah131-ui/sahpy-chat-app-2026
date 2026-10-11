@@ -215,6 +215,72 @@
         "updatedAt"
       ]
     },
+    "PhoneSearchEntry": {
+      "title": "PhoneSearchEntry",
+      "description": "Public non-PII phone lookup index mapping a normalized E.164 phone number to a Firebase Auth UID.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID that added this phone number.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "phoneKey": {
+          "type": "string",
+          "description": "Normalized E.164 phone number matching document ID.",
+          "minLength": 7,
+          "maxLength": 20,
+          "pattern": "^\\+[1-9][0-9]{6,18}$"
+        },
+        "username": {
+          "type": "string",
+          "description": "Normalized unique username of the user.",
+          "minLength": 3,
+          "maxLength": 30,
+          "pattern": "^[a-z0-9_]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Public display name of the user.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "bio": {
+          "type": "string",
+          "description": "Public bio or status.",
+          "minLength": 0,
+          "maxLength": 200
+        },
+        "avatarFallbackColor": {
+          "type": "string",
+          "description": "Avatar fallback color identifier.",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "uid",
+        "phoneKey",
+        "username",
+        "displayName",
+        "bio",
+        "avatarFallbackColor",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
     "ChatRoom": {
       "title": "ChatRoom",
       "description": "A direct conversation room between two verified, registered Firebase UIDs.",
@@ -576,6 +642,10 @@
     "/usernames/{username}": {
       "schema": { "$ref": "#/entities/UsernameReservation" },
       "description": "Enforces atomic username uniqueness and maps @username to a registered Firebase UID."
+    },
+    "/phone_index/{phoneKey}": {
+      "schema": { "$ref": "#/entities/PhoneSearchEntry" },
+      "description": "Maps a normalized E.164 phone number to a registered Firebase UID for point lookup without public enumeration."
     },
     "/chats/{chatId}": {
       "schema": { "$ref": "#/entities/ChatRoom" },

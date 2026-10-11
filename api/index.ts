@@ -191,18 +191,97 @@ function toPublicUser(u: RegisteredUser) {
     id: u.uid || u.id,
     uid: u.uid || u.id,
     name: u.name,
-    phone: u.phone,
-    normalizedPhone: u.normalizedPhone,
+    // Never expose raw phone number or email in public/search payloads
+    phone: u.username ? `@${u.username}` : '',
+    normalizedPhone: '',
     username: u.username,
     normalizedUsername: u.normalizedUsername,
     bio: u.bio,
     avatar: u.avatar,
     emailVerified: u.emailVerified,
-    phoneVerified: u.phoneVerified,
+    phoneVerified: false,
     isOnline: u.isOnline,
     lastSeen: u.lastSeen,
     createdAt: u.createdAt,
   };
+}
+
+const KNOWN_COUNTRY_CODES = [
+  '20',
+  '966',
+  '971',
+  '965',
+  '974',
+  '973',
+  '968',
+  '962',
+  '961',
+  '964',
+  '212',
+  '213',
+  '216',
+  '218',
+  '249',
+  '967',
+  '970',
+  '963',
+  '90',
+  '49',
+  '44',
+  '1',
+];
+
+function normalizePhoneQueryToE164Digits(
+  rawQuery: string,
+  defaultCountryCode = '+20'
+): string[] {
+  const digits = normalizeDigits(rawQuery);
+  if (digits.length < 7 || digits.length > 16) return [];
+
+  const candidates = new Set<string>();
+  const cleanCC = normalizeDigits(defaultCountryCode) || '20';
+
+  const trimmed = String(rawQuery || '').trim();
+  if (trimmed.startsWith('+') || trimmed.startsWith('00')) {
+    candidates.add(digits);
+  } else if (!digits.startsWith('0') && digits.length >= 9) {
+    candidates.add(digits);
+  }
+
+  const localNoZero = digits.replace(/^0+/, '');
+  if (localNoZero.length >= 7) {
+    candidates.add(`${cleanCC}${localNoZero}`);
+    for (const cc of ['20', '966', '971', '965', '974', '962', '964', '212', '1']) {
+      candidates.add(`${cc}${localNoZero}`);
+    }
+  }
+
+  for (const cand of Array.from(candidates)) {
+    for (const cc of KNOWN_COUNTRY_CODES) {
+      if (cand.startsWith(`${cc}0`) && cand.length - cc.length - 1 >= 7) {
+        candidates.add(`${cc}${cand.slice(cc.length + 1).replace(/^0+/, '')}`);
+      }
+    }
+  }
+
+  return Array.from(candidates);
+}
+
+const searchRateLimitMap = new Map<string, number[]>();
+const SEARCH_WINDOW_MS = 60 * 1000;
+const MAX_SEARCHES_PER_WINDOW = 25;
+
+function checkSearchRateLimit(ipKey: string): boolean {
+  const now = Date.now();
+  const prev = searchRateLimitMap.get(ipKey) || [];
+  const active = prev.filter((ts) => now - ts < SEARCH_WINDOW_MS);
+  if (active.length >= MAX_SEARCHES_PER_WINDOW) {
+    searchRateLimitMap.set(ipKey, active);
+    return false;
+  }
+  active.push(now);
+  searchRateLimitMap.set(ipKey, active);
+  return true;
 }
 
 const app = express();
@@ -238,35 +317,62 @@ app.get('/api/auth/resolve-username', (req, res) => {
 });
 
 app.get('/api/users', (_req, res) => {
-  const store = loadStore();
-  res.json({ users: store.users.map(toPublicUser) });
+  // Do not allow bulk enumeration of all accounts
+  res.json({ users: [] });
 });
 
 app.get('/api/users/search', (req, res) => {
-  const store = loadStore();
-  const q = String(req.query.q || req.query.phone || '').trim();
-  if (!q) {
-    res.json({ users: [] });
+  const clientIp = String(
+    req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'local'
+  );
+  if (!checkSearchRateLimit(clientIp)) {
+    res.status(429).json({
+      error: 'SEARCH_RATE_LIMITED',
+      message: 'تم تجاوز الحد المسموح لمحاولات البحث. يرجى الانتظار قليلاً.',
+      users: [],
+    });
     return;
   }
-  const qDigits = normalizeDigits(q);
+
+  const store = loadStore();
+  const q = String(req.query.q || req.query.phone || '').trim();
+  const cc = String(req.query.cc || '+20').trim();
+  if (!q || q.length < 3) {
+    res.json({ user: null, users: [] });
+    return;
+  }
+
   const qLower = q.toLowerCase();
   const qUser = normalizeUsername(q);
+  const phoneCandidates = normalizePhoneQueryToE164Digits(q, cc);
 
-  const matched = store.users.filter((u) => {
-    const uidMatch = (u.uid || u.id).toLowerCase() === qLower;
-    const usernameMatch =
-      u.username?.toLowerCase() === qLower.replace(/^@+/, '') ||
-      (qUser.length >= 2 && u.normalizedUsername?.includes(qUser));
-    const digitMatch =
-      qDigits.length >= 4 &&
-      (u.normalizedPhone.includes(qDigits) ||
-        qDigits.includes(u.normalizedPhone));
-    const nameMatch = qLower.length >= 3 && u.name.toLowerCase().includes(qLower);
-    return uidMatch || usernameMatch || digitMatch || nameMatch;
+  const matched = store.users
+    .filter((u) => {
+      const uidMatch = (u.uid || u.id).toLowerCase() === qLower;
+      const usernameMatch =
+        Boolean(qUser && qUser.length >= 3) &&
+        u.normalizedUsername === qUser;
+
+      const userPhoneDigits = normalizeDigits(u.normalizedPhone || u.phone);
+      const phoneMatch =
+        userPhoneDigits.length >= 7 &&
+        phoneCandidates.some(
+          (cand) =>
+            cand === userPhoneDigits ||
+            (cand.length >= 9 &&
+              userPhoneDigits.length >= 9 &&
+              cand.slice(-9) === userPhoneDigits.slice(-9))
+        );
+
+      return uidMatch || usernameMatch || phoneMatch;
+    })
+    .slice(0, 5)
+    .map(toPublicUser);
+
+  res.json({
+    user: matched[0] || null,
+    users: matched,
   });
-
-  res.json({ users: matched.map(toPublicUser) });
 });
 
 app.post('/api/auth/register', (req, res) => {
@@ -280,7 +386,6 @@ app.post('/api/auth/register', (req, res) => {
     bio,
     avatar,
     emailVerified,
-    phoneVerified,
   } = req.body || {};
 
   if (!uid || typeof uid !== 'string') {
@@ -291,8 +396,17 @@ app.post('/api/auth/register', (req, res) => {
   }
 
   const cleanEmail = String(email || '').trim().toLowerCase();
-  const cleanPhone = String(phone || '').trim();
-  const norm = normalizeDigits(cleanPhone);
+  const rawPhoneStr = String(phone || '').trim();
+  const isUnsetPhone =
+    !rawPhoneStr ||
+    rawPhoneStr === '+0000000' ||
+    rawPhoneStr === '+201000000000' ||
+    rawPhoneStr.startsWith('@');
+  const cleanPhone = isUnsetPhone ? '' : rawPhoneStr;
+  const normCandidates = cleanPhone
+    ? normalizePhoneQueryToE164Digits(cleanPhone, '+20')
+    : [];
+  const norm = normCandidates[0] || normalizeDigits(cleanPhone);
   const cleanUser = normalizeUsername(username);
 
   if (!cleanUser || cleanUser.length < 3) {
@@ -335,7 +449,7 @@ app.post('/api/auth/register', (req, res) => {
     existing.uid = uid;
     existing.id = uid;
     if (name && String(name).trim()) existing.name = String(name).trim();
-    if (cleanPhone) {
+    if (phone !== undefined) {
       existing.phone = cleanPhone;
       existing.normalizedPhone = norm;
     }
@@ -345,13 +459,13 @@ app.post('/api/auth/register', (req, res) => {
     if (bio && String(bio).trim()) existing.bio = String(bio).trim();
     if (avatar) existing.avatar = avatar;
     existing.emailVerified = Boolean(emailVerified ?? existing.emailVerified);
-    existing.phoneVerified = Boolean(phoneVerified ?? existing.phoneVerified);
+    existing.phoneVerified = false;
     existing.isOnline = true;
     existing.lastSeen = 'متصل الآن';
     saveStore(store);
     res.json({
       user: toPublicUser(existing),
-      users: store.users.map(toPublicUser),
+      users: [toPublicUser(existing)],
       isNew: false,
     });
     return;
@@ -371,7 +485,7 @@ app.post('/api/auth/register', (req, res) => {
       avatar ||
       'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=240&auto=format&fit=crop&q=80',
     emailVerified: Boolean(emailVerified),
-    phoneVerified: Boolean(phoneVerified),
+    phoneVerified: false,
     isOnline: true,
     lastSeen: 'متصل الآن',
     createdAt: new Date().toISOString(),
@@ -381,7 +495,7 @@ app.post('/api/auth/register', (req, res) => {
   saveStore(store);
   res.json({
     user: toPublicUser(newUser),
-    users: store.users.map(toPublicUser),
+    users: [toPublicUser(newUser)],
     isNew: true,
   });
 });

@@ -199,18 +199,55 @@ function toPublicUser(u: RegisteredUser) {
     id: u.uid || u.id,
     uid: u.uid || u.id,
     name: u.name,
-    phone: u.phone,
-    normalizedPhone: u.normalizedPhone,
+    // Never expose raw phone number or email in public directory / search payloads
+    phone: u.username ? `@${u.username}` : '',
+    normalizedPhone: '',
     username: u.username,
     normalizedUsername: u.normalizedUsername,
     bio: u.bio,
     avatar: u.avatar,
     emailVerified: u.emailVerified,
-    phoneVerified: u.phoneVerified,
+    phoneVerified: false,
     isOnline: u.isOnline,
     lastSeen: u.lastSeen,
     createdAt: u.createdAt,
   };
+}
+
+function normalizePhoneDigitsCandidates(rawInput: string, defaultCountryCode = '+20'): string[] {
+  const digits = normalizeDigits(rawInput);
+  if (digits.length < 7) return [];
+  const ccDigits = normalizeDigits(defaultCountryCode) || '20';
+  const candidates = new Set<string>();
+
+  candidates.add(digits);
+  if (rawInput.trim().startsWith('00') && digits.startsWith('00')) {
+    candidates.add(digits.slice(2));
+  }
+  if (digits.startsWith('0')) {
+    const withoutZero = digits.replace(/^0+/, '');
+    if (withoutZero.length >= 6) {
+      candidates.add(`${ccDigits}${withoutZero}`);
+    }
+  } else if (!digits.startsWith(ccDigits) && digits.length <= 11) {
+    candidates.add(`${ccDigits}${digits}`);
+  }
+  return Array.from(candidates).filter((c) => c.length >= 7 && c.length <= 18);
+}
+
+const searchRateLimitMap = new Map<string, number[]>();
+function isSearchAllowedForClient(clientKey: string): boolean {
+  const now = Date.now();
+  const history = (searchRateLimitMap.get(clientKey) || []).filter(
+    (t) => now - t < 60000
+  );
+  if (history.length >= 25) {
+    searchRateLimitMap.set(clientKey, history);
+    return false;
+  }
+  history.push(now);
+  searchRateLimitMap.set(clientKey, history);
+  return true;
 }
 
 async function startServer() {
@@ -247,7 +284,7 @@ async function startServer() {
     ws.send(
       JSON.stringify({
         type: 'init',
-        users: store.users.map(toPublicUser),
+        users: [],
         messages: store.messages.slice(-150),
         groups: store.groups,
         stories: store.stories,
@@ -270,7 +307,6 @@ async function startServer() {
             user.isOnline = true;
             user.lastSeen = 'متصل الآن';
             saveStore(store);
-            broadcast({ type: 'users:update', users: store.users.map(toPublicUser) });
           }
         } else if (data.type === 'chat:message' && data.message) {
           const msg: ChatMessagePayload = data.message;
@@ -317,35 +353,58 @@ async function startServer() {
     res.json({ email: found.email, uid: found.uid || found.id });
   });
 
-  // REST API: Get registered users (public fields only)
+  // REST API: Prevent enumerating all accounts easily — returns empty list unless searched via /api/users/search
   app.get('/api/users', (_req, res) => {
-    res.json({ users: store.users.map(toPublicUser) });
+    res.json({ users: [] });
   });
 
-  // REST API: Search real registered users by UID, exact/partial @username, or phone
+  // REST API: Search real registered users by UID, exact @username, or normalized phone (with rate limiting & zero PII leak)
   app.get('/api/users/search', (req, res) => {
+    const clientIp = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'local');
+    if (!isSearchAllowedForClient(clientIp)) {
+      res.status(429).json({
+        error: 'SEARCH_RATE_LIMITED',
+        message: 'لقد تجاوزت الحد المسموح لمحاولات البحث. يرجى الانتظار قليلاً.',
+        users: [],
+      });
+      return;
+    }
+
     const q = String(req.query.q || req.query.phone || '').trim();
-    if (!q) {
+    const cc = String(req.query.cc || '+20').trim();
+    if (!q || q.length < 3) {
       res.json({ users: [] });
       return;
     }
-    const qDigits = normalizeDigits(q);
+
     const qLower = q.toLowerCase();
     const qUser = normalizeUsername(q);
+    const phoneCandidates = normalizePhoneDigitsCandidates(q, cc);
 
     const matched = store.users.filter((u) => {
       const uidMatch = (u.uid || u.id).toLowerCase() === qLower;
       const usernameMatch =
-        u.username?.toLowerCase() === qLower.replace(/^@+/, '') ||
-        (qUser.length >= 2 && u.normalizedUsername?.includes(qUser));
-      const digitMatch =
-        qDigits.length >= 4 &&
-        (u.normalizedPhone.includes(qDigits) || qDigits.includes(u.normalizedPhone));
-      const nameMatch = qLower.length >= 3 && u.name.toLowerCase().includes(qLower);
-      return uidMatch || usernameMatch || digitMatch || nameMatch;
+        qUser.length >= 3 &&
+        (u.username?.toLowerCase() === qLower.replace(/^@+/, '') ||
+          u.normalizedUsername === qUser);
+
+      const uPhoneDigits = normalizeDigits(u.normalizedPhone || u.phone);
+      const phoneMatch =
+        uPhoneDigits.length >= 7 &&
+        u.phone !== '+0000000' &&
+        u.phone !== '+201000000000' &&
+        phoneCandidates.some(
+          (cand) =>
+            cand === uPhoneDigits ||
+            (cand.length >= 9 &&
+              uPhoneDigits.length >= 9 &&
+              cand.slice(-9) === uPhoneDigits.slice(-9))
+        );
+
+      return uidMatch || usernameMatch || phoneMatch;
     });
 
-    res.json({ users: matched.map(toPublicUser) });
+    res.json({ users: matched.slice(0, 5).map(toPublicUser) });
   });
 
   // REST API: Register or sync verified Firebase Auth user profile (Never stores passwords or OTPs)
@@ -359,7 +418,6 @@ async function startServer() {
       bio,
       avatar,
       emailVerified,
-      phoneVerified,
     } = req.body || {};
 
     if (!uid || typeof uid !== 'string') {
@@ -370,8 +428,10 @@ async function startServer() {
     }
 
     const cleanEmail = String(email || '').trim().toLowerCase();
-    const cleanPhone = String(phone || '').trim();
-    const norm = normalizeDigits(cleanPhone);
+    const rawPhone = String(phone || '').trim();
+    const cleanPhone =
+      rawPhone === '+0000000' || rawPhone === '+201000000000' ? '' : rawPhone;
+    const norm = cleanPhone ? normalizeDigits(cleanPhone) : '';
     const cleanUser = normalizeUsername(username);
 
     if (!cleanUser || cleanUser.length < 3) {
@@ -416,7 +476,7 @@ async function startServer() {
       existing.uid = uid;
       existing.id = uid;
       if (name && String(name).trim()) existing.name = String(name).trim();
-      if (cleanPhone) {
+      if (phone !== undefined) {
         existing.phone = cleanPhone;
         existing.normalizedPhone = norm;
       }
@@ -426,14 +486,13 @@ async function startServer() {
       if (bio && String(bio).trim()) existing.bio = String(bio).trim();
       if (avatar) existing.avatar = avatar;
       existing.emailVerified = Boolean(emailVerified ?? existing.emailVerified);
-      existing.phoneVerified = Boolean(phoneVerified ?? existing.phoneVerified);
+      existing.phoneVerified = false;
       existing.isOnline = true;
       existing.lastSeen = 'متصل الآن';
       saveStore(store);
-      broadcast({ type: 'users:update', users: store.users.map(toPublicUser) });
       res.json({
         user: toPublicUser(existing),
-        users: store.users.map(toPublicUser),
+        users: [],
         isNew: false,
       });
       return;
@@ -453,7 +512,7 @@ async function startServer() {
         avatar ||
         'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=240&auto=format&fit=crop&q=80',
       emailVerified: Boolean(emailVerified),
-      phoneVerified: Boolean(phoneVerified),
+      phoneVerified: false,
       isOnline: true,
       lastSeen: 'متصل الآن',
       createdAt: new Date().toISOString(),
@@ -461,11 +520,10 @@ async function startServer() {
 
     store.users.unshift(newUser);
     saveStore(store);
-    broadcast({ type: 'users:update', users: store.users.map(toPublicUser) });
 
     res.json({
       user: toPublicUser(newUser),
-      users: store.users.map(toPublicUser),
+      users: [],
       isNew: true,
     });
   });

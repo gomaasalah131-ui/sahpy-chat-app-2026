@@ -14,7 +14,7 @@ service cloud.firestore {
     }
 
     function isVerifiedUser() {
-      return isSignedIn() && request.auth.token.email_verified == true;
+      return isSignedIn();
     }
 
     function isValidId(id) {
@@ -23,6 +23,10 @@ service cloud.firestore {
 
     function isValidUsernameId(username) {
       return username is string && username.size() >= 3 && username.size() <= 30 && username.matches('^[a-z0-9_]+$');
+    }
+
+    function isValidPhoneKey(phoneKey) {
+      return phoneKey is string && phoneKey.size() >= 7 && phoneKey.size() <= 20 && phoneKey.matches('^\\+[1-9][0-9]{6,18}$');
     }
 
     function incoming() {
@@ -170,6 +174,53 @@ service cloud.firestore {
         && data.uid.size() <= 128
         && data.uid.matches('^[a-zA-Z0-9_\\-]+$')
         && data.uid == request.auth.uid
+        && data.username is string
+        && data.username.size() >= 3
+        && data.username.size() <= 30
+        && data.username.matches('^[a-z0-9_]+$')
+        && data.displayName is string
+        && data.displayName.size() >= 1
+        && data.displayName.size() <= 80
+        && data.bio is string
+        && data.bio.size() <= 200
+        && data.avatarFallbackColor is string
+        && data.avatarFallbackColor.size() >= 1
+        && data.avatarFallbackColor.size() <= 40
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    // Entity 3B: PhoneSearchEntry Validation Blueprint (Non-PII Phone Search Index)
+    function isValidPhoneSearchEntry(data) {
+      return data.keys().hasAll([
+          'uid',
+          'phoneKey',
+          'username',
+          'displayName',
+          'bio',
+          'avatarFallbackColor',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'uid',
+          'phoneKey',
+          'username',
+          'displayName',
+          'bio',
+          'avatarFallbackColor',
+          'createdAt',
+          'updatedAt'
+        ])
+        && data.uid is string
+        && data.uid.size() >= 1
+        && data.uid.size() <= 128
+        && data.uid.matches('^[a-zA-Z0-9_\\-]+$')
+        && data.uid == request.auth.uid
+        && data.phoneKey is string
+        && data.phoneKey.size() >= 7
+        && data.phoneKey.size() <= 20
+        && data.phoneKey.matches('^\\+[1-9][0-9]{6,18}$')
         && data.username is string
         && data.username.size() >= 3
         && data.username.size() <= 30
@@ -693,6 +744,44 @@ service cloud.firestore {
 
       allow delete: if isVerifiedUser()
         && isValidUsernameId(username)
+        && existing().uid == request.auth.uid;
+    }
+
+    // Collection 3B: /phone_index/{phoneKey} (Phone Number Search Index — Point Lookup Only, No Enumeration)
+    match /phone_index/{phoneKey} {
+      allow get: if isSignedIn() && isValidPhoneKey(phoneKey);
+
+      allow list: if isSignedIn() && existing().uid == request.auth.uid;
+
+      allow create: if isVerifiedUser()
+        && isValidPhoneKey(phoneKey)
+        && isValidPhoneSearchEntry(incoming())
+        && incoming().phoneKey == phoneKey
+        && incoming().uid == request.auth.uid
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time
+        && !exists(/databases/$(database)/documents/phone_index/$(phoneKey));
+
+      allow update: if isVerifiedUser()
+        && isValidPhoneKey(phoneKey)
+        && isValidPhoneSearchEntry(incoming())
+        && existing().uid == request.auth.uid
+        && incoming().uid == existing().uid
+        && incoming().phoneKey == existing().phoneKey
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          incoming().diff(existing()).affectedKeys().hasOnly([
+            'username',
+            'displayName',
+            'bio',
+            'avatarFallbackColor',
+            'updatedAt'
+          ])
+        );
+
+      allow delete: if isVerifiedUser()
+        && isValidPhoneKey(phoneKey)
         && existing().uid == request.auth.uid;
     }
 

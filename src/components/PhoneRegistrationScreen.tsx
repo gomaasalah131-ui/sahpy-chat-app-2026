@@ -29,19 +29,12 @@ import { WallpaperConfig } from '../types/chat';
 import {
   auth,
   User,
-  ConfirmationResult,
   signInWithGoogleCloud,
   registerWithEmailAndPasswordCloud,
   loginWithEmailAndPasswordCloud,
   sendVerificationEmailToCurrentUser,
   sendPasswordResetEmailCloud,
   reloadAndCheckCurrentUser,
-  sendPhoneOtpViaFirebase,
-  confirmPhoneOtpViaFirebase,
-  resetRecaptchaVerifier,
-  ensureRecaptchaVerifier,
-  inspectFirebasePhoneAuthEnvironment,
-  FirebasePhoneAuthDiagnostics,
   signOutFromCloud,
   checkUsernameAvailability,
   reserveUsernameAndSaveProfileToFirestore,
@@ -53,6 +46,8 @@ import {
   getCachedEmailForUsername,
   isValidUsernameFormat,
   isValidPhoneE164Format,
+  splitPhoneIntoCountryAndLocal,
+  formatDisplayPhone,
   translateFirebaseAuthError,
 } from '../lib/firebase';
 import defaultAvatarImg from '../assets/images/avatar_ahmed_profile_1791581695415.jpg';
@@ -188,12 +183,11 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
     firebaseUser ? currentUsername || '' : ''
   );
   const [email, setEmail] = useState(firebaseUser?.email || '');
-  const [countryCode, setCountryCode] = useState('+20');
-  const [phoneDigits, setPhoneDigits] = useState(
-    firebaseUser
-      ? (currentPhone || '').replace(/^\+\d+\s*/, '').replace(/\D/g, '')
-      : ''
+  const initialPhoneSplit = splitPhoneIntoCountryAndLocal(
+    firebaseUser ? currentPhone : ''
   );
+  const [countryCode, setCountryCode] = useState(initialPhoneSplit.countryCode);
+  const [phoneDigits, setPhoneDigits] = useState(initialPhoneSplit.localDigits);
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
   const [avatarUrl, setAvatarUrl] = useState<string>(
@@ -217,29 +211,12 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
     'idle' | 'checking' | 'available' | 'taken' | 'invalid'
   >('idle');
 
-  // Verification State (Email + SMS OTP)
+  // Verification State (Email Verification Only)
   const [isEmailVerified, setIsEmailVerified] = useState<boolean>(
     Boolean(firebaseUser?.emailVerified)
   );
-  const [isPhoneVerified, setIsPhoneVerified] = useState<boolean>(
-    Boolean(firebaseUser?.phoneNumber)
-  );
-  const [otpSent, setOtpSent] = useState(false);
-  const [otpCode, setOtpCode] = useState('');
-  const [confirmationResult, setConfirmationResult] =
-    useState<ConfirmationResult | null>(null);
-  const [isSendingOtp, setIsSendingOtp] = useState(false);
-  const [isConfirmingOtp, setIsConfirmingOtp] = useState(false);
   const [isCheckingEmail, setIsCheckingEmail] = useState(false);
   const [showFirebaseSetupHelp, setShowFirebaseSetupHelp] = useState(false);
-  const [recaptchaSize, setRecaptchaSize] = useState<'invisible' | 'normal'>(
-    'invisible'
-  );
-  const [phoneOtpError, setPhoneOtpError] = useState('');
-  const [phoneOtpRawDetail, setPhoneOtpRawDetail] = useState('');
-  const [phoneOtpSuccess, setPhoneOtpSuccess] = useState('');
-  const [phoneDiagnostics, setPhoneDiagnostics] =
-    useState<FirebasePhoneAuthDiagnostics | null>(null);
 
   // General UI Feedback
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -247,40 +224,6 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
   const [successMsg, setSuccessMsg] = useState('');
 
   const avatarFileInputRef = useRef<HTMLInputElement | null>(null);
-  const sendingOtpLockRef = useRef<boolean>(false);
-
-  // Load live Firebase Phone Auth & Authorized Domains diagnostics when entering verify tab
-  useEffect(() => {
-    if (authTab === 'verify') {
-      inspectFirebasePhoneAuthEnvironment()
-        .then((diag) => setPhoneDiagnostics(diag))
-        .catch(() => {});
-    } else {
-      resetRecaptchaVerifier('firebase-recaptcha-container');
-    }
-    return () => {
-      resetRecaptchaVerifier('firebase-recaptcha-container');
-    };
-  }, [authTab]);
-
-  // If user switches to visible 'normal' reCAPTCHA v2, pre-render the checkbox in the container
-  useEffect(() => {
-    if (authTab === 'verify' && recaptchaSize === 'normal') {
-      const timer = setTimeout(() => {
-        ensureRecaptchaVerifier('firebase-recaptcha-container', 'normal', {
-          onExpired: () => {
-            setPhoneOtpError(
-              'انتهت صلاحية تحقق reCAPTCHA v2. يرجى تحديد المربع مرة أخرى.'
-            );
-          },
-        }).catch((err) => {
-          const translated = translateFirebaseAuthError(err);
-          setPhoneOtpError(translated);
-        });
-      }, 150);
-      return () => clearTimeout(timer);
-    }
-  }, [authTab, recaptchaSize]);
 
   // Sync Firebase Auth user state into form when user changes
   useEffect(() => {
@@ -293,9 +236,6 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
       if (firebaseUser.photoURL && avatarUrl === defaultAvatarImg) {
         setAvatarUrl(firebaseUser.photoURL);
       }
-      if (firebaseUser.phoneNumber) {
-        setIsPhoneVerified(true);
-      }
       // Restore pending signup profile if present
       try {
         const pendingRaw =
@@ -306,7 +246,9 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
           if (pending.fullName) setFullName(pending.fullName);
           if (pending.username) setUsername(pending.username);
           if (pending.email) setEmail(pending.email);
-          if (pending.phoneDigits) setPhoneDigits(pending.phoneDigits);
+          if (pending.phoneDigits !== undefined) {
+            setPhoneDigits(pending.phoneDigits);
+          }
           if (pending.countryCode) setCountryCode(pending.countryCode);
           if (pending.avatarUrl) setAvatarUrl(pending.avatarUrl);
         }
@@ -319,13 +261,16 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
           if (prof) {
             if (prof.displayName) setFullName(prof.displayName);
             if (prof.username) setUsername(prof.username);
-            if (prof.phoneVerified) setIsPhoneVerified(true);
+            if (prof.phoneTag) {
+              const split = splitPhoneIntoCountryAndLocal(prof.phoneTag);
+              setCountryCode(split.countryCode);
+              setPhoneDigits(split.localDigits);
+            }
           }
         })
         .catch(() => {});
     } else {
       setIsEmailVerified(false);
-      setIsPhoneVerified(false);
     }
   }, [firebaseUser]);
 
@@ -428,11 +373,14 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
       return;
     }
 
-    const phoneCheck = isValidPhoneE164Format(countryCode, phoneDigits);
+    // Phone number is optional during sign-up (used only as a profile field for searching people)
+    const phoneCheck = isValidPhoneE164Format(countryCode, phoneDigits, {
+      optional: true,
+    });
     if (!phoneCheck.valid) {
       setErrorMsg(
         phoneCheck.reason ||
-          'صيغة رقم الهاتف غير صحيحة. يرجى إدخال رقم هاتف صالح مع رمز الدولة.'
+          'صيغة رقم الهاتف غير صحيحة. يمكنك تركه فارغاً أو إدخال رقم هاتف صالح مع رمز الدولة.'
       );
       return;
     }
@@ -638,9 +586,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
             pending?.username || username || ''
           );
           const candidatePhone =
-            pending?.phoneE164 ||
-            loggedInUser.phoneNumber ||
-            '+201000000000';
+            pending?.phoneE164 !== undefined ? pending.phoneE164 : '';
 
           if (
             candidateName.length >= 3 &&
@@ -656,9 +602,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                 currentBio ||
                 `حساب موثق على SAHPY-CHAT • @${candidateUsername} ✨`,
               wallpaperTheme: 'aurora-borealis',
-              phoneVerified: Boolean(
-                isPhoneVerified || loggedInUser.phoneNumber
-              ),
+              phoneVerified: false,
             });
           }
         } catch {
@@ -670,7 +614,11 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
         setFullName(existingProfile.displayName);
         setUsername(existingProfile.username);
         setEmail(existingProfile.email);
-        setIsPhoneVerified(existingProfile.phoneVerified);
+        if (existingProfile.phoneTag) {
+          const split = splitPhoneIntoCountryAndLocal(existingProfile.phoneTag);
+          setCountryCode(split.countryCode);
+          setPhoneDigits(split.localDigits);
+        }
         cacheUsernameEmailMapping(
           existingProfile.username,
           loggedInUser.email || existingProfile.email
@@ -682,15 +630,13 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
         await onCompleteRegistration({
           uid: loggedInUser.uid,
           name: existingProfile.displayName,
-          phone: existingProfile.phoneTag,
+          phone: formatDisplayPhone(existingProfile.phoneTag),
           username: existingProfile.username,
           email: loggedInUser.email || existingProfile.email,
           bio: existingProfile.bio,
           avatar: avatarUrl,
           emailVerified: true,
-          phoneVerified: Boolean(
-            existingProfile.phoneVerified || loggedInUser.phoneNumber
-          ),
+          phoneVerified: false,
           stayOnScreen: false,
         });
       } else {
@@ -732,23 +678,22 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
       if (existingProfile && existingProfile.username) {
         setFullName(existingProfile.displayName);
         setUsername(existingProfile.username);
-        setIsPhoneVerified(existingProfile.phoneVerified);
         await onCompleteRegistration({
           uid: googleUser.uid,
           name: existingProfile.displayName,
-          phone: existingProfile.phoneTag,
+          phone: formatDisplayPhone(existingProfile.phoneTag),
           username: existingProfile.username,
           email: googleUser.email || existingProfile.email,
           bio: existingProfile.bio,
           avatar: googleUser.photoURL || avatarUrl,
           emailVerified: true,
-          phoneVerified: existingProfile.phoneVerified,
+          phoneVerified: false,
           stayOnScreen: false,
         });
         return;
       }
 
-      // New Google user -> suggest unique username and open Verification & Phone step
+      // New Google user -> suggest unique username and open Profile Completion step
       if (!username && googleUser.email) {
         const suggested = sanitizeUsername(googleUser.email.split('@')[0]);
         if (suggested.length >= 3) {
@@ -757,7 +702,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
       }
       setAuthTab('verify');
       setSuccessMsg(
-        `تمت المصادقة عبر Google بنجاح (${googleUser.email}) وبريدك الإلكتروني مؤكد تلقائياً ✅ يرجى اختيار اسم المستخدم الفريد وتأكيد رقم الهاتف لإكمال ملفك الشخصي في Firestore.`
+        `تمت المصادقة عبر Google بنجاح (${googleUser.email}) وبريدك الإلكتروني مؤكد تلقائياً ✅ يرجى اختيار اسم المستخدم الفريد (@username) لإكمال ملفك الشخصي في Firestore.`
       );
     } catch (err) {
       setErrorMsg(translateFirebaseAuthError(err));
@@ -767,7 +712,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
   };
 
   // ========================================================================
-  // 4. EMAIL VERIFICATION & PHONE SMS OTP HANDLERS
+  // 4. EMAIL VERIFICATION HANDLERS
   // ========================================================================
   const handleResendVerificationEmail = async () => {
     setErrorMsg('');
@@ -794,7 +739,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
       if (refreshedUser?.emailVerified) {
         setIsEmailVerified(true);
         setSuccessMsg(
-          'تم التحقق من تأكيد بريدك الإلكتروني بنجاح عبر Firebase Authentication ✅'
+          'تم التحقق من تأكيد بريدك الإلكتروني بنجاح عبر Firebase Authentication ✅ يمكنك الآن حفظ ملفك الشخصي وفتح المحادثات.'
         );
       } else {
         setIsEmailVerified(false);
@@ -806,122 +751,6 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
       setErrorMsg(translateFirebaseAuthError(err));
     } finally {
       setIsCheckingEmail(false);
-    }
-  };
-
-  const handleSendSmsOtp = async () => {
-    // Strictly prevent duplicate/concurrent OTP requests
-    if (sendingOtpLockRef.current || isSendingOtp) {
-      return;
-    }
-
-    setErrorMsg('');
-    setSuccessMsg('');
-    setPhoneOtpError('');
-    setPhoneOtpRawDetail('');
-    setPhoneOtpSuccess('');
-
-    const phoneCheck = isValidPhoneE164Format(countryCode, phoneDigits);
-    if (!phoneCheck.valid) {
-      const msg =
-        phoneCheck.reason ||
-        'يرجى إدخال رقم هاتف صحيح مع رمز الدولة لإرسال رسالة SMS.';
-      setErrorMsg(msg);
-      setPhoneOtpError(msg);
-      return;
-    }
-
-    sendingOtpLockRef.current = true;
-    setIsSendingOtp(true);
-
-    try {
-      const result = await sendPhoneOtpViaFirebase(
-        phoneCheck.e164,
-        'firebase-recaptcha-container',
-        { recaptchaSize }
-      );
-      // Only mark OTP as sent after Firebase genuinely succeeds and returns a valid verificationId
-      setConfirmationResult(result);
-      setOtpSent(true);
-      const okText = `تم إرسال رمز التحقق (OTP) فعلياً عبر Firebase SMS إلى الرقم ${phoneCheck.e164} بنجاح 📲 يرجى إدخال الرمز المكون من 6 أرقام.`;
-      setSuccessMsg(okText);
-      setPhoneOtpSuccess(okText);
-    } catch (err) {
-      // Never claim OTP was sent when Firebase request fails; reset state and reCAPTCHA
-      setOtpSent(false);
-      setConfirmationResult(null);
-      resetRecaptchaVerifier('firebase-recaptcha-container');
-
-      const rawCode = (err as { code?: string })?.code || '';
-      const rawMessage =
-        err instanceof Error ? err.message : String(err || '');
-      const translated = translateFirebaseAuthError(err);
-
-      setErrorMsg(translated);
-      setPhoneOtpError(translated);
-      setPhoneOtpRawDetail(
-        rawCode
-          ? `${rawCode}${rawMessage ? ` — ${rawMessage}` : ''}`
-          : rawMessage
-      );
-      setShowFirebaseSetupHelp(true);
-
-      // Refresh live diagnostics so user sees Authorized Domains & config status
-      inspectFirebasePhoneAuthEnvironment()
-        .then((diag) => setPhoneDiagnostics(diag))
-        .catch(() => {});
-
-      // If visible 'normal' mode was active, re-render fresh checkbox after reset
-      if (recaptchaSize === 'normal') {
-        setTimeout(() => {
-          ensureRecaptchaVerifier(
-            'firebase-recaptcha-container',
-            'normal'
-          ).catch(() => {});
-        }, 250);
-      }
-    } finally {
-      sendingOtpLockRef.current = false;
-      setIsSendingOtp(false);
-    }
-  };
-
-  const handleVerifySmsOtp = async () => {
-    if (isConfirmingOtp) return;
-    setErrorMsg('');
-    setSuccessMsg('');
-    setPhoneOtpError('');
-    setPhoneOtpSuccess('');
-
-    if (!confirmationResult) {
-      const msg = 'يرجى الضغط على "إرسال رمز OTP" أولاً وانتظار نجاح الإرسال.';
-      setErrorMsg(msg);
-      setPhoneOtpError(msg);
-      return;
-    }
-    if (!/^\d{6}$/.test(otpCode.trim())) {
-      const msg = 'يرجى إدخال رمز التحقق المكون من 6 أرقام بشكل صحيح.';
-      setErrorMsg(msg);
-      setPhoneOtpError(msg);
-      return;
-    }
-
-    setIsConfirmingOtp(true);
-    try {
-      await confirmPhoneOtpViaFirebase(confirmationResult, otpCode.trim());
-      setIsPhoneVerified(true);
-      setOtpSent(false);
-      setOtpCode('');
-      const okText =
-        'تم تأكيد رقم الهاتف فعلياً عبر Firebase Phone Authentication ✅';
-      setSuccessMsg(okText);
-      setPhoneOtpSuccess(okText);
-    } catch (err) {
-      const translated = translateFirebaseAuthError(err);
-      setErrorMsg(translated);
-      setPhoneOtpError(translated);
-    } finally {
-      setIsConfirmingOtp(false);
     }
   };
 
@@ -963,41 +792,44 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
       return;
     }
 
-    const phoneCheck = isValidPhoneE164Format(countryCode, phoneDigits);
-    const finalPhoneE164 = activeUser.phoneNumber || phoneCheck.e164;
-    if (!activeUser.phoneNumber && !phoneCheck.valid) {
+    // Phone number is optional in profile (for user search only, never marked verified)
+    const phoneCheck = isValidPhoneE164Format(countryCode, phoneDigits, {
+      optional: true,
+    });
+    if (!phoneCheck.valid) {
       setErrorMsg(
-        phoneCheck.reason || 'يرجى إدخال رقم هاتف صحيح مع رمز الدولة.'
+        phoneCheck.reason ||
+          'صيغة رقم الهاتف غير صحيحة. يمكنك تركه فارغاً أو إدخال رقم هاتف صالح مع رمز الدولة.'
       );
       return;
     }
 
     setIsSubmitting(true);
     try {
-      // Atomically reserve unique username and save UserProfile & PublicDirectoryProfile in Firestore
+      // Atomically reserve unique username and save UserProfile, PublicDirectoryProfile, and optional PhoneSearchEntry in Firestore
       const savedProfile = await reserveUsernameAndSaveProfileToFirestore({
         user: activeUser,
         displayName: cleanName,
         username: cleanUsername,
         email: activeUser.email || email.trim().toLowerCase(),
-        phoneTag: finalPhoneE164,
+        phoneTag: phoneCheck.e164,
         bio:
           currentBio ||
           `حساب موثق على SAHPY-CHAT • @${cleanUsername} ✨`,
         wallpaperTheme: 'aurora-borealis',
-        phoneVerified: Boolean(isPhoneVerified || activeUser.phoneNumber),
+        phoneVerified: false,
       });
 
       await onCompleteRegistration({
         uid: activeUser.uid,
         name: savedProfile.displayName,
-        phone: savedProfile.phoneTag,
+        phone: formatDisplayPhone(savedProfile.phoneTag),
         username: savedProfile.username,
         email: savedProfile.email,
         bio: savedProfile.bio,
         avatar: avatarUrl,
         emailVerified: savedProfile.emailVerified,
-        phoneVerified: savedProfile.phoneVerified,
+        phoneVerified: false,
         stayOnScreen: false,
       });
     } catch (err) {
@@ -1137,7 +969,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
             />
             <StepItem
               number="2"
-              text="Verify Email & Phone OTP (SMS)"
+              text="Verify Email via Firebase Auth"
               active={authTab === 'verify'}
             />
             <StepItem
@@ -1254,7 +1086,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
               }`}
             >
               <ShieldCheck className="w-3.5 h-3.5" />
-              <span>التحقق (البريد/OTP)</span>
+              <span>تأكيد البريد والملف</span>
             </button>
 
             <button
@@ -1506,7 +1338,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                       إنشاء حساب جديد • Create Account
                     </h2>
                     <p className="text-xs text-white/50 mt-0.5">
-                      جميع الحقول مطلوبة ويتم التحقق من عدم تكرار اسم المستخدم والبريد الإلكتروني
+                      التسجيل بالبريد الإلكتروني وكلمة المرور مع فحص عدم تكرار اسم المستخدم (رقم الهاتف اختياري للبحث فقط)
                     </p>
                   </div>
                 </div>
@@ -1593,11 +1425,16 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                   </div>
                 </div>
 
-                {/* 4. Phone Number with Country Code */}
+                {/* 4. Optional Phone Number with Country Code (for Search Only) */}
                 <div>
-                  <label className="block text-xs font-bold text-white/85 mb-1.5">
-                    4. رقم الهاتف مع رمز الدولة (لإرسال رمز التحقق SMS OTP) *
-                  </label>
+                  <div className="flex items-center justify-between flex-wrap gap-1 mb-1.5">
+                    <label className="block text-xs font-bold text-white/85">
+                      4. رقم الهاتف مع رمز الدولة (اختياري — للبحث عن الأشخاص فقط)
+                    </label>
+                    <span className="text-[10px] text-cyan-300 bg-cyan-500/10 border border-cyan-500/25 px-2 py-0.5 rounded-full">
+                      حقل ملف شخصي للبحث فقط (بدون SMS)
+                    </span>
+                  </div>
                   <div className="flex items-center gap-2" dir="ltr">
                     <select
                       value={countryCode}
@@ -1613,13 +1450,15 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                     <input
                       dir="ltr"
                       type="tel"
-                      required
                       value={phoneDigits}
                       onChange={(e) => setPhoneDigits(e.target.value)}
-                      placeholder="1098765432"
+                      placeholder="1098765432 (اختياري)"
                       className="flex-1 bg-black border border-white/15 rounded-xl h-11 px-3.5 text-white placeholder:text-white/30 focus:outline-none focus:border-emerald-400 text-xs sm:text-sm font-mono"
                     />
                   </div>
+                  <p className="text-[11px] text-white/45 mt-1">
+                    يمكنك ترك رقم الهاتف فارغاً الآن وإضافته أو تعديله لاحقاً من ملفك الشخصي. يُستخدم فقط لتمكين الأصدقاء من العثور عليك بالرقم.
+                  </p>
                 </div>
 
                 {/* 5. Password & 6. Confirm Password */}
@@ -1751,8 +1590,8 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                   <UserPlus className="w-4 h-4" />
                   <span>
                     {isSubmitting
-                      ? 'جاري إنشاء الحساب وإرسال رابط التحقق...'
-                      : 'إنشاء الحساب وإرسال رمز التحقق'}
+                      ? 'جاري إنشاء الحساب وإرسال رابط تأكيد البريد...'
+                      : 'إنشاء الحساب وإرسال رابط تأكيد البريد الإلكتروني'}
                   </span>
                 </button>
               </form>
@@ -1760,7 +1599,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
           )}
 
           {/* ============================================================== */}
-          {/* VIEW 3: VERIFICATION CENTER (تأكيد البريد الإلكتروني + SMS OTP)   */}
+          {/* VIEW 3: VERIFICATION CENTER (تأكيد البريد الإلكتروني وتثبيت الملف الشخصي) */}
           {/* ============================================================== */}
           {authTab === 'verify' && (
             <div dir="rtl" className="space-y-4">
@@ -1769,10 +1608,10 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                   <div>
                     <h2 className="text-lg sm:text-xl font-bold text-white flex items-center gap-2">
                       <ShieldCheck className="w-5 h-5 text-emerald-400" />
-                      <span>مركز التحقق الإلزامي وتفعيل الحساب</span>
+                      <span>مركز تأكيد البريد الإلكتروني وتفعيل الحساب</span>
                     </h2>
                     <p className="text-xs text-white/50 mt-0.5">
-                      لا يُعتبر الحساب مكتمل التحقق قبل تأكيد البريد الإلكتروني وحفظ المعرّف الفريد في Firestore
+                      لا يُسمح باستخدام ميزات التطبيق المحمية قبل تأكيد البريد الإلكتروني وحفظ المعرّف الفريد في Firestore
                     </p>
                   </div>
                   {firebaseUser && (
@@ -1799,7 +1638,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                       </span>
                     </div>
                     <p className="text-xs text-white/70">
-                      يمكنك إنشاء حساب جديد أو تسجيل الدخول لتأكيد البريد الإلكتروني، أو اختبار وتأكيد رقم الهاتف عبر SMS OTP بالأسفل مباشرة:
+                      يرجى إنشاء حساب جديد أو تسجيل الدخول أولاً لتأكيد بريدك الإلكتروني عبر Firebase Authentication:
                     </p>
                     <div className="flex items-center gap-2">
                       <button
@@ -1873,288 +1712,17 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                   </div>
                 )}
 
-                {/* Step B: Phone OTP Verification via Firebase Phone Auth SMS */}
-                <div className="p-4 rounded-2xl bg-black/70 border border-white/10 space-y-3">
-                  <div className="flex items-center justify-between flex-wrap gap-2">
-                    <div className="flex items-center gap-2">
-                      <Smartphone className="w-4 h-4 text-cyan-400" />
-                      <span className="text-xs sm:text-sm font-bold text-white">
-                        ثانياً: تأكيد رقم الهاتف عبر SMS OTP (Firebase Phone Auth)
-                      </span>
-                    </div>
-                    {isPhoneVerified ? (
-                      <span className="px-2.5 py-1 rounded-full bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[11px] font-bold flex items-center gap-1">
-                        <CheckCircle2 className="w-3.5 h-3.5" />
-                        الهاتف مؤكد بـ OTP ✅
-                      </span>
-                    ) : (
-                      <span className="px-2.5 py-1 rounded-full bg-cyan-500/15 border border-cyan-500/30 text-cyan-300 text-[11px] font-bold">
-                        تحقق عبر رسالة SMS
-                      </span>
-                    )}
-                  </div>
-
-                  {/* reCAPTCHA v2 Mode Selector & Manual Reset */}
-                  <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] bg-white/5 px-3 py-2 rounded-xl border border-white/10">
-                    <div className="flex items-center gap-2 text-white/75">
-                      <span>وضع التحقق الأمني (reCAPTCHA v2):</span>
-                      <button
-                        type="button"
-                        disabled={isSendingOtp}
-                        onClick={() => {
-                          setRecaptchaSize('invisible');
-                          resetRecaptchaVerifier('firebase-recaptcha-container');
-                        }}
-                        className={`px-2 py-0.5 rounded-lg font-bold cursor-pointer transition-all ${
-                          recaptchaSize === 'invisible'
-                            ? 'bg-cyan-500 text-slate-950'
-                            : 'bg-black/60 text-white/60 hover:text-white'
-                        }`}
-                      >
-                        تلقائي (Invisible v2)
-                      </button>
-                      <button
-                        type="button"
-                        disabled={isSendingOtp}
-                        onClick={() => {
-                          setRecaptchaSize('normal');
-                          resetRecaptchaVerifier('firebase-recaptcha-container');
-                        }}
-                        className={`px-2 py-0.5 rounded-lg font-bold cursor-pointer transition-all ${
-                          recaptchaSize === 'normal'
-                            ? 'bg-cyan-500 text-slate-950'
-                            : 'bg-black/60 text-white/60 hover:text-white'
-                        }`}
-                      >
-                        مرئي (مربع اختيار v2)
-                      </button>
-                    </div>
-
-                    <button
-                      type="button"
-                      disabled={isSendingOtp}
-                      onClick={() => {
-                        resetRecaptchaVerifier('firebase-recaptcha-container');
-                        setPhoneOtpError('');
-                        setPhoneOtpRawDetail('');
-                        if (recaptchaSize === 'normal') {
-                          setTimeout(() => {
-                            ensureRecaptchaVerifier(
-                              'firebase-recaptcha-container',
-                              'normal'
-                            ).catch(() => {});
-                          }, 100);
-                        }
-                      }}
-                      className="text-cyan-300 hover:underline flex items-center gap-1 cursor-pointer"
-                    >
-                      <RefreshCw className="w-3 h-3" />
-                      <span>إعادة ضبط reCAPTCHA</span>
-                    </button>
-                  </div>
-
-                  <div className="flex items-center gap-2" dir="ltr">
-                    <select
-                      value={countryCode}
-                      onChange={(e) => setCountryCode(e.target.value)}
-                      className="bg-brand-gray border border-white/15 rounded-xl h-10 px-2 text-white text-xs font-mono"
-                    >
-                      {COUNTRY_CODES.map((c) => (
-                        <option
-                          key={c.code}
-                          value={c.code}
-                          className="bg-slate-900"
-                        >
-                          {c.label}
-                        </option>
-                      ))}
-                    </select>
-                    <input
-                      dir="ltr"
-                      type="tel"
-                      value={phoneDigits}
-                      onChange={(e) => setPhoneDigits(e.target.value)}
-                      placeholder="1098765432"
-                      className="flex-1 bg-brand-gray border border-white/15 rounded-xl h-10 px-3 text-white text-xs font-mono"
-                    />
-                    <button
-                      type="button"
-                      disabled={isSendingOtp}
-                      onClick={handleSendSmsOtp}
-                      className="px-3.5 h-10 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 font-bold text-xs shrink-0 cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
-                    >
-                      {isSendingOtp && (
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                      )}
-                      <span>
-                        {isSendingOtp
-                          ? 'جاري الإرسال...'
-                          : otpSent
-                          ? 'إعادة إرسال SMS'
-                          : 'إرسال رمز OTP'}
-                      </span>
-                    </button>
-                  </div>
-
-                  {/* Real Firebase Recaptcha Container */}
-                  <div
-                    id="firebase-recaptcha-container"
-                    className="flex justify-center overflow-x-auto py-1 min-h-[4px]"
-                  />
-
-                  {/* Inline Real Error & Status Feedback right next to the SMS button */}
-                  {phoneOtpError && (
-                    <div
-                      dir="rtl"
-                      className="p-3 rounded-xl bg-rose-500/15 border border-rose-500/40 text-xs text-rose-200 space-y-1.5 leading-relaxed"
-                    >
-                      <div className="flex items-start gap-2 font-bold text-rose-300">
-                        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                        <span>فشل إرسال رسالة SMS من Firebase:</span>
-                      </div>
-                      <p className="text-rose-100">{phoneOtpError}</p>
-                      {phoneOtpRawDetail && (
-                        <p
-                          dir="ltr"
-                          className="text-[11px] font-mono bg-black/50 px-2.5 py-1.5 rounded-lg text-rose-300 border border-rose-500/20 break-all"
-                        >
-                          Firebase SDK Error: {phoneOtpRawDetail}
-                        </p>
-                      )}
-                    </div>
-                  )}
-
-                  {phoneOtpSuccess && (
-                    <div
-                      dir="rtl"
-                      className="p-3 rounded-xl bg-emerald-500/15 border border-emerald-500/40 text-xs text-emerald-200 flex items-start gap-2 leading-relaxed"
-                    >
-                      <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
-                      <span>{phoneOtpSuccess}</span>
-                    </div>
-                  )}
-
-                  {/* Live Firebase Phone Auth & Authorized Domains Diagnostic Box */}
-                  {phoneDiagnostics && (
-                    <div
-                      dir="rtl"
-                      className="p-3 rounded-xl bg-white/5 border border-white/10 text-[11px] text-white/75 space-y-1.5 leading-relaxed"
-                    >
-                      <div className="flex items-center justify-between flex-wrap gap-1 font-bold text-cyan-300">
-                        <span>فحص إعدادات Firebase Phone Auth & Authorized Domains:</span>
-                        <div className="flex items-center flex-wrap gap-1.5" dir="ltr">
-                          <span
-                            className={`px-2 py-0.5 rounded text-[10px] font-mono ${
-                              phoneDiagnostics.identityToolkitApiEnabled
-                                ? 'bg-emerald-500/20 text-emerald-300'
-                                : 'bg-rose-500/20 text-rose-300'
-                            }`}
-                          >
-                            Identity Toolkit API:{' '}
-                            {phoneDiagnostics.identityToolkitApiEnabled
-                              ? 'Enabled ✓'
-                              : 'Disabled ✗'}
-                          </span>
-                          <span
-                            className={`px-2 py-0.5 rounded text-[10px] font-mono ${
-                              phoneDiagnostics.secureTokenApiEnabled
-                                ? 'bg-emerald-500/20 text-emerald-300'
-                                : 'bg-amber-500/20 text-amber-300'
-                            }`}
-                          >
-                            Secure Token API:{' '}
-                            {phoneDiagnostics.secureTokenApiEnabled
-                              ? 'Enabled ✓'
-                              : 'Starter Tier Bypass Active ⚡'}
-                          </span>
-                          <span
-                            className={`px-2 py-0.5 rounded text-[10px] font-mono ${
-                              phoneDiagnostics.isCurrentDomainAuthorized
-                                ? 'bg-emerald-500/20 text-emerald-300'
-                                : 'bg-rose-500/20 text-rose-300'
-                            }`}
-                          >
-                            {phoneDiagnostics.currentHostname}:{' '}
-                            {phoneDiagnostics.isCurrentDomainAuthorized
-                              ? 'Authorized ✓'
-                              : 'NOT in Authorized Domains ✗'}
-                          </span>
-                        </div>
-                      </div>
-                      {!phoneDiagnostics.secureTokenApiEnabled && (
-                        <p className="text-amber-300/95">
-                          • <strong>بخصوص خطأ Secure Token API (المشروع 892622995916):</strong>{' '}
-                          {phoneDiagnostics.secureTokenApiStatusDetail}
-                        </p>
-                      )}
-                      <p className="text-white/65">
-                        • <strong>بخصوص رسالة reCAPTCHA Enterprise:</strong> ظهور الرسالة{' '}
-                        <code dir="ltr" className="text-amber-300 font-mono">
-                          Failed to initialize reCAPTCHA Enterprise config. Triggering the reCAPTCHA v2 verification.
-                        </code>{' '}
-                        هو سلوك طبيعي من مكتبة Firebase لأن المشروع يستخدم{' '}
-                        <strong>reCAPTCHA v2</strong> المجاني بدلاً من Enterprise، ولا يمنع الإرسال بحد ذاته.
-                      </p>
-                      {!phoneDiagnostics.isCurrentDomainAuthorized && (
-                        <p className="text-rose-300 font-bold">
-                          • تنبيه النطاق: النطاق الحالي ({phoneDiagnostics.currentHostname}) غير مضاف في Authorized domains. يرجى إضافته من Firebase Console &gt; Authentication &gt; Settings &gt; Authorized domains.
-                        </p>
-                      )}
-                      <p className="text-white/65">
-                        • <strong>لتفعيل إرسال SMS في Firebase Console:</strong> تأكد من تفعيل مزود{' '}
-                        <strong>Phone</strong> في{' '}
-                        <span dir="ltr" className="font-mono text-cyan-300">
-                          Authentication &gt; Sign-in method
-                        </span>
-                        ، وإما تفعيل خطة Blaze للرسائل الحقيقية أو إضافة رقمك في{' '}
-                        <span dir="ltr" className="font-mono text-cyan-300">
-                          Phone numbers for testing
-                        </span>
-                        .
-                      </p>
-                    </div>
-                  )}
-
-                  {otpSent && confirmationResult && (
-                    <div className="pt-2 space-y-2.5 border-t border-white/10">
-                      <label className="block text-xs text-emerald-300 font-bold">
-                        أدخل رمز التحقق المكون من 6 أرقام المرسل عبر SMS:
-                      </label>
-                      <div className="flex items-center gap-2" dir="ltr">
-                        <input
-                          type="text"
-                          maxLength={6}
-                          value={otpCode}
-                          onChange={(e) =>
-                            setOtpCode(e.target.value.replace(/\D/g, ''))
-                          }
-                          placeholder="123456"
-                          className="flex-1 bg-black border border-emerald-500/50 rounded-xl h-11 px-4 text-center text-base font-bold tracking-[0.4em] text-white font-mono focus:outline-none"
-                        />
-                        <button
-                          type="button"
-                          disabled={isConfirmingOtp}
-                          onClick={handleVerifySmsOtp}
-                          className="px-5 h-11 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs cursor-pointer disabled:opacity-50"
-                        >
-                          {isConfirmingOtp ? 'جاري التأكيد...' : 'تأكيد الرمز'}
-                        </button>
-                      </div>
-                    </div>
-                  )}
-                </div>
-
-                {/* Step C: Confirm Full Name & Unique @username in Firestore */}
+                {/* Step B: Confirm Full Name, Unique @username, and Optional Search Phone in Firestore */}
                 {firebaseUser && (
                   <>
                     <div className="p-4 rounded-2xl bg-black/70 border border-white/10 space-y-3">
                       <span className="text-xs sm:text-sm font-bold text-white block">
-                        ثالثاً: تثبيت الاسم واسم المستخدم الفريد (@username) في Firestore
+                        ثانياً: تثبيت الاسم واسم المستخدم الفريد (@username) ورقم الهاتف الاختياري
                       </span>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                         <div>
                           <label className="block text-[11px] text-white/60 mb-1">
-                            الاسم الكامل
+                            الاسم الكامل *
                           </label>
                           <input
                             type="text"
@@ -2166,7 +1734,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                         </div>
                         <div>
                           <label className="block text-[11px] text-white/60 mb-1">
-                            اسم المستخدم الفريد (@username)
+                            اسم المستخدم الفريد (@username) *
                           </label>
                           <input
                             dir="ltr"
@@ -2175,6 +1743,43 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                             onChange={(e) => handleCheckUsername(e.target.value)}
                             placeholder="salah_gomaa"
                             className="w-full bg-brand-gray border border-white/15 rounded-xl h-10 px-3 text-xs text-white font-mono"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="pt-2 border-t border-white/10 space-y-1.5">
+                        <div className="flex items-center justify-between flex-wrap gap-1">
+                          <label className="text-[11px] text-white/70 flex items-center gap-1.5">
+                            <Smartphone className="w-3.5 h-3.5 text-cyan-400" />
+                            <span>رقم الهاتف في الملف الشخصي (اختياري — للبحث عن الأشخاص فقط)</span>
+                          </label>
+                          <span className="text-[10px] text-white/45">
+                            غير مؤكد بـ SMS • وسيلة بحث فقط
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-2" dir="ltr">
+                          <select
+                            value={countryCode}
+                            onChange={(e) => setCountryCode(e.target.value)}
+                            className="bg-brand-gray border border-white/15 rounded-xl h-10 px-2 text-white text-xs font-mono"
+                          >
+                            {COUNTRY_CODES.map((c) => (
+                              <option
+                                key={c.code}
+                                value={c.code}
+                                className="bg-slate-900"
+                              >
+                                {c.label}
+                              </option>
+                            ))}
+                          </select>
+                          <input
+                            dir="ltr"
+                            type="tel"
+                            value={phoneDigits}
+                            onChange={(e) => setPhoneDigits(e.target.value)}
+                            placeholder="1098765432 (اختياري)"
+                            className="flex-1 bg-brand-gray border border-white/15 rounded-xl h-10 px-3 text-white text-xs font-mono"
                           />
                         </div>
                       </div>
@@ -2273,7 +1878,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
               <span className="flex items-center gap-2">
                 <Info className="w-4 h-4" />
                 <span>
-                  إعدادات Firebase Console المطلوب تفعيلها يدوياً (للبريد ورسائل SMS OTP)
+                  إعدادات Firebase Console لتسجيل البريد الإلكتروني وكلمة المرور
                 </span>
               </span>
               <span>{showFirebaseSetupHelp ? 'إخفاء ▲' : 'عرض التفاصيل ▼'}</span>
@@ -2289,15 +1894,7 @@ export const PhoneRegistrationScreen: React.FC<PhoneRegistrationScreenProps> = (
                   فعّل مزود <strong>Email/Password</strong>.
                 </p>
                 <p>
-                  2. <strong>تفعيل رسائل الهاتف (Phone Auth SMS OTP):</strong> من نفس القائمة فعّل مزود{' '}
-                  <strong>Phone</strong>. لإرسال SMS حقيقي للهواتف يتطلب Firebase تفعيل خطة الفوترة (Blaze) أو إضافة أرقام تجربة مجانية داخل{' '}
-                  <span dir="ltr" className="text-cyan-300 font-mono">
-                    Phone numbers for testing
-                  </span>
-                  .
-                </p>
-                <p>
-                  3. <strong>النطاقات المصرح بها (Authorized Domains):</strong> تأكد من إضافة نطاق موقعك (مثل رابط Vercel أو Cloud Run) داخل{' '}
+                  2. <strong>النطاقات المصرح بها (Authorized Domains):</strong> تأكد من إضافة نطاق موقعك (مثل رابط Vercel أو Cloud Run) داخل{' '}
                   <span dir="ltr" className="text-cyan-300 font-mono">
                     Authentication &gt; Settings &gt; Authorized domains
                   </span>

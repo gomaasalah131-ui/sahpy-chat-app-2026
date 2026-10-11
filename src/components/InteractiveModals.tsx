@@ -38,12 +38,17 @@ import { Contact, StoryItem, WallpaperThemeId } from '../types/chat';
 import {
   RegisteredDirectoryUser,
   compressAvatarFile,
+  COUNTRY_CODES,
 } from './PhoneRegistrationScreen';
 import { WALLPAPER_THEMES } from '../data/initialChats';
 import {
   auth,
   findRegisteredUserInFirestore,
   PublicDirectoryUser,
+  splitPhoneIntoCountryAndLocal,
+  isValidPhoneE164Format,
+  buildNormalizedPhoneSearchCandidates,
+  formatDisplayPhone,
 } from '../lib/firebase';
 
 export function formatRemaining24h(expiresAt?: number): string {
@@ -843,6 +848,7 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
   onOpenCreateGroup,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
+  const [searchCountryCode, setSearchCountryCode] = useState('+20');
   const [firestoreResult, setFirestoreResult] =
     useState<PublicDirectoryUser | null>(null);
   const [isSearchingFirestore, setIsSearchingFirestore] = useState(false);
@@ -863,7 +869,7 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
     const timer = setTimeout(async () => {
       setIsSearchingFirestore(true);
       try {
-        const found = await findRegisteredUserInFirestore(q);
+        const found = await findRegisteredUserInFirestore(q, searchCountryCode);
         if (!cancelled) {
           if (found && found.uid !== myUid) {
             setFirestoreResult(found);
@@ -871,24 +877,37 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
             setFirestoreResult(null);
           }
         }
-      } catch {
-        if (!cancelled) setFirestoreResult(null);
+      } catch (err) {
+        if (!cancelled) {
+          setFirestoreResult(null);
+          if (err instanceof Error && err.message === 'SEARCH_RATE_LIMITED') {
+            setSearchError(
+              'لقد تجاوزت الحد المسموح لمحاولات البحث المتتالية. يرجى الانتظار قليلاً ثم المحاولة مرة أخرى.'
+            );
+          }
+        }
       } finally {
         if (!cancelled) setIsSearchingFirestore(false);
       }
-    }, 300);
+    }, 350);
 
     return () => {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [searchQuery, myUid]);
+  }, [searchQuery, searchCountryCode, myUid]);
 
   const combinedDirectory = React.useMemo(() => {
     if (!hasActiveSearch) return [];
     const q = searchQuery.trim().toLowerCase();
     const cleanQUser = q.replace(/^@+/, '');
-    const qDigits = searchQuery.replace(/[^\d٠-٩۰-۹]/g, '');
+    const phoneCandidates = buildNormalizedPhoneSearchCandidates(
+      searchQuery.trim(),
+      searchCountryCode
+    );
+    const candidateDigitsSet = new Set(
+      phoneCandidates.map((p) => p.replace(/\D/g, ''))
+    );
 
     const map = new Map<string, RegisteredDirectoryUser>();
 
@@ -897,36 +916,56 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
         id: firestoreResult.uid,
         uid: firestoreResult.uid,
         name: firestoreResult.displayName,
-        phone: firestoreResult.phoneVerified ? 'مؤكد عبر OTP' : 'مسجل في Firestore',
+        phone: `@${firestoreResult.username || firestoreResult.uid.slice(0, 8)}`,
         username: firestoreResult.username,
-        bio: firestoreResult.bio || 'مستخدم موثق في SAHPY-CHAT ✨',
+        bio: firestoreResult.bio || 'مستخدم مسجل في SAHPY-CHAT ✨',
         avatar:
           'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=240&auto=format&fit=crop&q=80',
         emailVerified: firestoreResult.emailVerified,
-        phoneVerified: firestoreResult.phoneVerified,
+        phoneVerified: false,
         isOnline: true,
-        lastSeen: 'مسجل وموثق',
+        lastSeen: 'مسجل في SAHPY-CHAT',
       });
     }
 
     registeredUsers.forEach((u) => {
       const uid = u.uid || u.id;
       if (!uid || uid === myUid) return;
-      const uDigits = (u.phone || '').replace(/[^\d]/g, '');
+      const uDigits = (u.normalizedPhone || u.phone || '').replace(/[^\d]/g, '');
       const uUsername = (u.username || '').toLowerCase();
+      const matchesPhone =
+        uDigits.length >= 7 &&
+        Array.from(candidateDigitsSet).some(
+          (cand) =>
+            cand === uDigits ||
+            (cand.length >= 9 &&
+              uDigits.length >= 9 &&
+              cand.slice(-9) === uDigits.slice(-9))
+        );
       const matches =
         uid.toLowerCase() === q ||
         (cleanQUser.length >= 3 && uUsername === cleanQUser) ||
-        (cleanQUser.length >= 3 && uUsername.includes(cleanQUser)) ||
-        (qDigits.length >= 5 && uDigits.includes(qDigits));
+        matchesPhone;
 
       if (matches && !map.has(uid)) {
-        map.set(uid, { ...u, id: uid, uid });
+        map.set(uid, {
+          ...u,
+          id: uid,
+          uid,
+          phone: `@${u.username || uid.slice(0, 8)}`,
+        });
       }
     });
 
     return Array.from(map.values());
-  }, [hasActiveSearch, searchQuery, firestoreResult, registeredUsers, myUid]);
+  }, [
+    hasActiveSearch,
+    searchQuery,
+    searchCountryCode,
+    firestoreResult,
+    registeredUsers,
+    myUid,
+  ]);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-fade-in">
@@ -938,10 +977,10 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
             </div>
             <div>
               <h3 className="text-base font-bold text-white">
-                بدء محادثة موثقة (بحث عبر Firestore)
+                بدء محادثة جديدة (البحث عن أشخاص)
               </h3>
               <p className="text-[11px] text-slate-400">
-                ابحث عن المستخدمين المسجلين فعلياً باستخدام @username أو UID الحقيقي
+                ابحث عن المستخدمين باستخدام اسم المستخدم (@username) أو رقم الهاتف
               </p>
             </div>
           </div>
@@ -970,16 +1009,34 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
 
         <div className="p-5 space-y-4 overflow-y-auto custom-scrollbar">
           <div className="space-y-3">
-            <label className="block text-xs font-bold text-emerald-400">
-              ابحث عن مستخدم مسجل في Firestore بواسطة اسم المستخدم الفريد (@username) أو UID أو رقم الهاتف:
-            </label>
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <label className="block text-xs font-bold text-emerald-400">
+                ابحث بواسطة اسم المستخدم (@username) أو رقم الهاتف:
+              </label>
+              <div className="flex items-center gap-1.5" dir="ltr">
+                <span className="text-[10px] text-slate-400" dir="rtl">
+                  كود الدولة للبحث بالهاتف:
+                </span>
+                <select
+                  value={searchCountryCode}
+                  onChange={(e) => setSearchCountryCode(e.target.value)}
+                  className="bg-slate-800 border border-white/15 rounded-lg h-7 px-2 text-white text-[11px] font-mono focus:outline-none focus:border-emerald-400"
+                >
+                  {COUNTRY_CODES.map((c) => (
+                    <option key={c.code} value={c.code} className="bg-slate-900">
+                      {c.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            </div>
             <div className="relative">
               <Search className="w-4 h-4 text-slate-400 absolute right-3.5 top-1/2 -translate-y-1/2" />
               <input
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="اكتب @username أو UID الحقيقي للمستخدم..."
+                placeholder="اكتب @username أو رقم الهاتف (مثال: 01098765432)..."
                 className="w-full py-2.5 pr-10 pl-4 rounded-xl bg-slate-800/90 border border-white/10 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-emerald-500/50"
               />
             </div>
@@ -993,20 +1050,20 @@ export const NewChatModal: React.FC<NewChatModalProps> = ({
                 <div className="p-3.5 rounded-2xl bg-slate-800/40 border border-white/10 flex items-start gap-2.5 text-xs text-slate-300 leading-relaxed">
                   <Lock className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
                   <span>
-                    حماية كاملة: لا يُسمح بإنشاء محادثة مع اسم عشوائي أو مستخدم غير موجود. اكتب اسم المستخدم الفريد (<span dir="ltr" className="text-emerald-400 font-mono">@username</span>) أو المعرّف (<span dir="ltr" className="text-cyan-400 font-mono">UID</span>) للبحث في قاعدة بيانات Firestore.
+                    حماية الخصوصية: لا يتم كشف البريد الإلكتروني أو رقم الهاتف في نتائج البحث، ولا يُسمح بسرد جميع الحسابات. أدخل اسم المستخدم (<span dir="ltr" className="text-emerald-400 font-mono">@username</span>) أو رقم الهاتف للبحث وبدء محادثة مرتبطة بـ <span dir="ltr" className="text-cyan-400 font-mono">UID</span>.
                   </span>
                 </div>
               ) : isSearchingFirestore ? (
                 <p className="text-xs text-emerald-300 text-center py-4 animate-pulse">
-                  جاري البحث في قاعدة بيانات Firebase Firestore...
+                  جاري البحث وتوحيد تنسيق الرقم في قاعدة بيانات Firestore...
                 </p>
               ) : combinedDirectory.length === 0 ? (
                 <div className="p-4 rounded-2xl bg-rose-500/10 border border-rose-500/30 text-xs text-rose-200 text-center space-y-1">
                   <p className="font-bold">
-                    لا يوجد مستخدم مسجل بهذا المعرّف في Firestore
+                    لم يتم العثور على مستخدم مطابق لبحثك
                   </p>
                   <p className="text-[11px] text-rose-300/80">
-                    تأكد من أن صديقك قام بإنشاء حسابه وتأكيد بريده الإلكتروني في SAHPY-CHAT، ثم ابحث عنه باستخدام @username أو UID الصحيح.
+                    تأكد من كتابة اسم المستخدم (@username) أو رقم الهاتف مع كود الدولة الصحيح.
                   </p>
                 </div>
               ) : (
@@ -1467,10 +1524,15 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
   onClose,
   onSaveProfile,
 }) => {
+  const initialSplit = splitPhoneIntoCountryAndLocal(
+    formatDisplayPhone(userPhone)
+  );
   const [name, setName] = useState(userName);
-  const [phone, setPhone] = useState(userPhone);
+  const [countryCode, setCountryCode] = useState(initialSplit.countryCode);
+  const [phoneDigits, setPhoneDigits] = useState(initialSplit.localDigits);
   const [bio, setBio] = useState(userBio);
   const [avatar, setAvatar] = useState(userAvatar);
+  const [phoneError, setPhoneError] = useState('');
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   const handleAvatarFileChange = async (
@@ -1488,9 +1550,20 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
+    setPhoneError('');
+    const phoneCheck = isValidPhoneE164Format(countryCode, phoneDigits, {
+      optional: true,
+    });
+    if (!phoneCheck.valid) {
+      setPhoneError(
+        phoneCheck.reason ||
+          'صيغة رقم الهاتف غير صحيحة. يمكنك تركه فارغاً أو إدخال رقم هاتف صالح مع كود الدولة.'
+      );
+      return;
+    }
     onSaveProfile(
       name.trim() || userName,
-      phone.trim() || userPhone,
+      phoneCheck.e164,
       bio.trim() || userBio,
       avatar
     );
@@ -1586,16 +1659,56 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
           </div>
 
           <div>
-            <label className="block text-xs text-slate-400 mb-1.5">
-              رقم الهاتف المرتبط
-            </label>
-            <input
-              type="text"
-              dir="ltr"
-              value={phone}
-              onChange={(e) => setPhone(e.target.value)}
-              className="w-full py-2.5 px-3.5 rounded-xl bg-slate-800/90 border border-white/10 text-sm text-white focus:outline-none focus:border-emerald-500/50 text-left font-mono"
-            />
+            <div className="flex items-center justify-between flex-wrap gap-1 mb-1.5">
+              <label className="text-xs text-slate-300 font-bold">
+                رقم الهاتف (اختياري — يُستخدم للبحث عنك فقط)
+              </label>
+              {phoneDigits && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPhoneDigits('');
+                    setPhoneError('');
+                  }}
+                  className="text-[11px] text-rose-400 hover:underline cursor-pointer"
+                >
+                  حذف الرقم
+                </button>
+              )}
+            </div>
+            <div className="flex items-center gap-2" dir="ltr">
+              <select
+                value={countryCode}
+                onChange={(e) => {
+                  setCountryCode(e.target.value);
+                  setPhoneError('');
+                }}
+                className="py-2.5 px-2.5 rounded-xl bg-slate-800/90 border border-white/10 text-xs text-white font-mono focus:outline-none focus:border-emerald-500/50 shrink-0"
+              >
+                {COUNTRY_CODES.map((c) => (
+                  <option key={c.code} value={c.code} className="bg-slate-900">
+                    {c.label}
+                  </option>
+                ))}
+              </select>
+              <input
+                type="tel"
+                dir="ltr"
+                value={phoneDigits}
+                onChange={(e) => {
+                  setPhoneDigits(e.target.value);
+                  setPhoneError('');
+                }}
+                placeholder="1098765432 (اختياري)"
+                className="flex-1 py-2.5 px-3.5 rounded-xl bg-slate-800/90 border border-white/10 text-sm text-white focus:outline-none focus:border-emerald-500/50 text-left font-mono"
+              />
+            </div>
+            <p className="text-[11px] text-slate-400 mt-1">
+              رقم الهاتف اختياري وغير مؤكد بـ SMS، ويُستخدم فقط لتمكين المستخدمين من العثور على حسابك عند البحث بالرقم.
+            </p>
+            {phoneError && (
+              <p className="text-xs text-rose-400 mt-1">{phoneError}</p>
+            )}
           </div>
 
           <div>
