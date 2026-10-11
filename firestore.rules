@@ -474,8 +474,7 @@ service cloud.firestore {
     match /users/{userId} {
       allow get: if isSignedIn()
         && isValidId(userId)
-        && request.auth.uid == userId
-        && existing().uid == request.auth.uid;
+        && request.auth.uid == userId;
 
       allow list: if isSignedIn()
         && request.auth.uid == userId
@@ -513,8 +512,7 @@ service cloud.firestore {
 
       allow delete: if isVerifiedUser()
         && isValidId(userId)
-        && request.auth.uid == userId
-        && existing().uid == request.auth.uid;
+        && request.auth.uid == userId;
 
       // Subcollection: /users/{userId}/contacts/{contactId}
       match /contacts/{contactId} {
@@ -522,7 +520,7 @@ service cloud.firestore {
           && isValidId(userId)
           && isValidId(contactId)
           && request.auth.uid == userId
-          && existing().ownerUid == request.auth.uid
+          && (resource == null || existing().ownerUid == request.auth.uid)
           && isParentUserOwner(userId);
 
         allow list: if isSignedIn()
@@ -562,7 +560,7 @@ service cloud.firestore {
           && isValidId(userId)
           && isValidId(contactId)
           && request.auth.uid == userId
-          && existing().ownerUid == request.auth.uid
+          && (resource == null || existing().ownerUid == request.auth.uid)
           && isParentUserOwner(userId);
 
         // Subcollection: /users/{userId}/contacts/{contactId}/messages/{messageId}
@@ -572,7 +570,7 @@ service cloud.firestore {
             && isValidId(contactId)
             && isValidId(messageId)
             && request.auth.uid == userId
-            && existing().ownerUid == request.auth.uid
+            && (resource == null || existing().ownerUid == request.auth.uid)
             && isParentContactOwner(userId, contactId);
 
           allow list: if isSignedIn()
@@ -616,7 +614,7 @@ service cloud.firestore {
             && isValidId(contactId)
             && isValidId(messageId)
             && request.auth.uid == userId
-            && existing().ownerUid == request.auth.uid
+            && (resource == null || existing().ownerUid == request.auth.uid)
             && isParentContactOwner(userId, contactId);
         }
       }
@@ -658,8 +656,7 @@ service cloud.firestore {
 
       allow delete: if isVerifiedUser()
         && isValidId(userId)
-        && request.auth.uid == userId
-        && existing().uid == request.auth.uid;
+        && request.auth.uid == userId;
     }
 
     // Collection 3: /usernames/{username} (Atomic Unique Username Reservation & Lookup)
@@ -704,6 +701,7 @@ service cloud.firestore {
       allow get: if isSignedIn()
         && isValidId(chatId)
         && (
+          resource == null ||
           existing().participantOneUid == request.auth.uid ||
           existing().participantTwoUid == request.auth.uid
         );
@@ -762,6 +760,7 @@ service cloud.firestore {
           && isValidId(chatId)
           && isValidId(messageId)
           && (
+            resource == null ||
             existing().senderUid == request.auth.uid ||
             existing().recipientUid == request.auth.uid
           )

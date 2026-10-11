@@ -430,9 +430,7 @@ export default function App() {
   const [isProfileOpen, setIsProfileOpen] = useState(false);
 
   // Current User Profile State
-  const [currentUserUid, setCurrentUserUid] = useState<string>(
-    () => (auth.currentUser?.emailVerified ? auth.currentUser.uid : '')
-  );
+  const [currentUserUid, setCurrentUserUid] = useState<string>('');
   const [userName, setUserName] = useState(() => {
     const raw = localStorage.getItem('nabd_user_name') || '𝔼𝕟𝕘𝕚𝕟𝕖𝕖𝕣 𝕊𝔸𝕃𝔸ℍ 𝔾𝕆𝕄𝔸𝔸';
     return raw.replace(/الديزينر انجينير\s*/g, '').trim() || '𝔼𝕟𝕘𝕚𝕟𝕖𝕖𝕣 𝕊𝔸𝕃𝔸ℍ 𝔾𝕆𝕄𝔸𝔸';
@@ -729,13 +727,17 @@ export default function App() {
       if (fbUser && fbUser.emailVerified) {
         setCurrentUserUid(fbUser.uid);
         localStorage.setItem('nabd_user_uid', fbUser.uid);
-        const profile = await fetchUserProfileByUid(fbUser.uid);
-        if (profile) {
-          setUserName(profile.displayName || fbUser.displayName || userName);
-          if (profile.phoneTag) setUserPhone(profile.phoneTag);
-          if (profile.username) setUserUsername(profile.username);
-          if (profile.bio) setUserBio(profile.bio);
-          setFirestoreConnected(true);
+        try {
+          const profile = await fetchUserProfileByUid(fbUser.uid);
+          if (profile) {
+            setUserName(profile.displayName || fbUser.displayName || userName);
+            if (profile.phoneTag) setUserPhone(profile.phoneTag);
+            if (profile.username) setUserUsername(profile.username);
+            if (profile.bio) setUserBio(profile.bio);
+            setFirestoreConnected(true);
+          }
+        } catch {
+          // Error is logged by handleFirestoreError
         }
       } else {
         setCurrentUserUid('');
@@ -749,7 +751,7 @@ export default function App() {
   // Search Firestore when typing in sidebar search box
   useEffect(() => {
     const q = searchQuery.trim();
-    if (q.length < 3) {
+    if (q.length < 3 || !currentUserUid) {
       setSidebarFirestoreMatch(null);
       return;
     }
@@ -770,12 +772,17 @@ export default function App() {
     };
   }, [searchQuery, currentUserUid]);
 
-  // Sync with Firebase Cloud Firestore
+  // Sync with Firebase Cloud Firestore only after auth token is validated
   useEffect(() => {
-    if (auth.currentUser && auth.currentUser.emailVerified) {
+    if (!currentUserUid || !auth.currentUser || !auth.currentUser.emailVerified) {
+      return;
+    }
+
+    if (viewMode === 'chat') {
       syncUserToFirestore({
         name: userName,
         phone: userPhone,
+        username: userUsername,
         bio: userBio,
         avatar: userAvatar,
       }).then(() => {
@@ -822,7 +829,16 @@ export default function App() {
       unsubUsers();
       unsubMessages();
     };
-  }, [userName, userPhone, userBio, mergeUsersIntoContacts, appendMessageToContact]);
+  }, [
+    currentUserUid,
+    viewMode,
+    userName,
+    userPhone,
+    userUsername,
+    userBio,
+    mergeUsersIntoContacts,
+    appendMessageToContact,
+  ]);
 
   // Connect to Backend REST + WebSocket for Users, Groups, Messages & 24h Stories
   useEffect(() => {

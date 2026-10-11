@@ -8,6 +8,7 @@ import {
   signInWithEmailAndPassword,
   sendEmailVerification,
   sendPasswordResetEmail,
+  applyActionCode,
   updateProfile,
   onAuthStateChanged,
   RecaptchaVerifier,
@@ -271,6 +272,12 @@ export function translateFirebaseAuthError(error: unknown): string {
   if (rawMsg.includes('USERNAME_NOT_FOUND')) {
     return 'اسم المستخدم هذا غير مسجل. تأكد من كتابته بشكل صحيح أو سجّل الدخول بالبريد الإلكتروني.';
   }
+  if (rawMsg.includes('TOKEN_NEEDS_RELOGIN_FOR_VERIFIED_CLAIM')) {
+    return 'تم تأكيد بريدك الإلكتروني بنجاح ✅ يرجى تسجيل الدخول بكلمة المرور الآن لتحديث رمز المصادقة (ID Token) وتفعيل حسابك في Firestore.';
+  }
+  if (rawMsg.includes('SESSION_EXPIRED_RELOGIN')) {
+    return 'انتهت صلاحية الجلسة السابقة. يرجى تسجيل الدخول مجدداً لتجديد رمز الأمان.';
+  }
   if (code.includes('auth/email-already-in-use')) {
     return 'البريد الإلكتروني مسجل بالفعل في Firebase Authentication [auth/email-already-in-use]. يرجى تسجيل الدخول بدلاً من إنشاء حساب جديد.';
   }
@@ -502,10 +509,82 @@ export async function inspectFirebasePhoneAuthEnvironment(): Promise<FirebasePho
 // 1. REAL FIREBASE AUTHENTICATION OPERATIONS
 // ============================================================================
 
-// Ephemeral in-memory credentials for the current browser tab session only (never persisted)
+// Ephemeral credentials for the current browser tab session only (stored in memory + sessionStorage, cleared on sign-out)
 // Used strictly as a fallback when Secure Token API (securetoken.googleapis.com) is disabled
-// in Starter Tier projects so Identity Toolkit API can mint a fresh idToken after email verification.
+// in Starter Tier projects so Identity Toolkit API can mint a fresh idToken after email verification or token expiry.
 let ephemeralSessionAuth: { email: string; password: string } | null = null;
+const EPHEMERAL_SESSION_KEY = 'sahpy_ephemeral_reauth_v1';
+
+function saveEphemeralSessionAuth(email: string, password: string): void {
+  const cleanEmail = email.trim().toLowerCase();
+  ephemeralSessionAuth = { email: cleanEmail, password };
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      sessionStorage.setItem(
+        EPHEMERAL_SESSION_KEY,
+        JSON.stringify({ email: cleanEmail, password })
+      );
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function getEphemeralSessionAuth(): { email: string; password: string } | null {
+  if (ephemeralSessionAuth) return ephemeralSessionAuth;
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      const raw = sessionStorage.getItem(EPHEMERAL_SESSION_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed?.email && parsed?.password) {
+          ephemeralSessionAuth = {
+            email: String(parsed.email),
+            password: String(parsed.password),
+          };
+          return ephemeralSessionAuth;
+        }
+      }
+    }
+  } catch {
+    // ignore parse errors
+  }
+  return null;
+}
+
+function clearEphemeralSessionAuth(): void {
+  ephemeralSessionAuth = null;
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      sessionStorage.removeItem(EPHEMERAL_SESSION_KEY);
+    }
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function decodeJwtPayload(token: string): {
+  exp?: number;
+  email_verified?: boolean;
+  user_id?: string;
+  sub?: string;
+} | null {
+  try {
+    const parts = String(token || '').split('.');
+    if (parts.length !== 3) return null;
+    const base64 = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4);
+    const json = decodeURIComponent(
+      atob(padded)
+        .split('')
+        .map((c) => '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2))
+        .join('')
+    );
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
 
 function isTokenServiceDisabledError(err: unknown): boolean {
   const code = String((err as { code?: string })?.code || '');
@@ -518,8 +597,297 @@ function isTokenServiceDisabledError(err: unknown): boolean {
   );
 }
 
+interface InternalStsTokenManager {
+  accessToken: string | null;
+  refreshToken: string | null;
+  expirationTime: number | null;
+  refresh?: (authInstance: unknown, oldToken: string) => Promise<void>;
+  updateTokensAndExpiration?: (
+    accessToken: string | null,
+    refreshToken: string | null,
+    expiresInSec: number
+  ) => void;
+  __sahpyPatched?: boolean;
+}
+
+/**
+ * Patches Firebase Auth's internal `StsTokenManager.prototype.refresh` without modifying `window.fetch`
+ * (which is a read-only getter in the AI Studio preview iframe).
+ * When `securetoken.googleapis.com` is disabled in Google AI Studio Starter Tier projects (892622995916),
+ * token refresh requests transparently fall back to `identitytoolkit.googleapis.com/v1/accounts:signInWithPassword`
+ * (when session credentials exist) or preserve non-expired JWTs so Firebase Auth and Firestore never fail.
+ */
+function patchStsTokenManagerObject(
+  manager: InternalStsTokenManager | null | undefined
+): void {
+  if (!manager || typeof manager !== 'object') return;
+  const proto = Object.getPrototypeOf(manager) as InternalStsTokenManager | null;
+  const target = proto && typeof proto.refresh === 'function' ? proto : manager;
+  if (target.__sahpyPatched || typeof target.refresh !== 'function') {
+    return;
+  }
+
+  const originalRefresh = target.refresh;
+  target.__sahpyPatched = true;
+
+  target.refresh = async function (
+    this: InternalStsTokenManager,
+    authInstance: unknown,
+    oldToken: string
+  ): Promise<void> {
+    try {
+      await originalRefresh.call(this, authInstance, oldToken);
+      return;
+    } catch (err) {
+      if (!isTokenServiceDisabledError(err)) {
+        throw err;
+      }
+
+      // 1. If ephemeral session credentials are available, mint a fresh Google-signed idToken via Identity Toolkit
+      const creds = getEphemeralSessionAuth();
+      if (creds?.email && creds?.password) {
+        try {
+          const itkRes = await fetch(
+            `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${encodeURIComponent(firebaseConfig.apiKey)}`,
+            {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                email: creds.email,
+                password: creds.password,
+                returnSecureToken: true,
+              }),
+            }
+          );
+          if (itkRes.ok) {
+            const itkData = await itkRes.json();
+            if (itkData?.idToken) {
+              const expiresInSec = Number(itkData.expiresIn || 3600);
+              const nextRefresh = String(itkData.refreshToken || oldToken || '');
+              if (typeof this.updateTokensAndExpiration === 'function') {
+                this.updateTokensAndExpiration(
+                  itkData.idToken,
+                  nextRefresh,
+                  expiresInSec
+                );
+              } else {
+                this.accessToken = itkData.idToken;
+                this.refreshToken = nextRefresh;
+                this.expirationTime = Date.now() + expiresInSec * 1000;
+              }
+              return;
+            }
+          }
+        } catch {
+          // Fall through to valid non-expired JWT check
+        }
+      }
+
+      // 2. Otherwise, if the existing JWT in memory is still valid and non-expired, preserve it
+      if (this.accessToken) {
+        const decoded = decodeJwtPayload(this.accessToken);
+        const nowMs = Date.now();
+        if (decoded?.exp && decoded.exp * 1000 > nowMs + 30000) {
+          const remainingSec = Math.max(
+            60,
+            Math.floor((decoded.exp * 1000 - nowMs) / 1000)
+          );
+          if (typeof this.updateTokensAndExpiration === 'function') {
+            this.updateTokensAndExpiration(
+              this.accessToken,
+              this.refreshToken || oldToken,
+              remainingSec
+            );
+          } else {
+            this.expirationTime = nowMs + remainingSec * 1000;
+          }
+          return;
+        }
+      }
+
+      throw err;
+    }
+  };
+}
+
+export function patchFirebaseUserTokenManager(
+  user: User | null | undefined
+): void {
+  if (!user) return;
+  const rawUser = user as unknown as {
+    stsTokenManager?: InternalStsTokenManager;
+  };
+  if (rawUser.stsTokenManager) {
+    patchStsTokenManagerObject(rawUser.stsTokenManager);
+  }
+}
+
+try {
+  if (typeof auth.beforeAuthStateChanged === 'function') {
+    auth.beforeAuthStateChanged((user) => {
+      patchFirebaseUserTokenManager(user);
+    });
+  }
+} catch {
+  // ignore if unsupported in environment
+}
+
+/**
+ * Ensures `auth.currentUser` has a valid, non-expired JWT idToken before making Firestore requests.
+ * When `securetoken.googleapis.com` is disabled in Google AI Studio Starter Tier projects (892622995916),
+ * an expired cached session in IndexedDB causes Firestore to send requests with `request.auth == null`,
+ * resulting in `Missing or insufficient permissions.` on `users/{uid}`.
+ * This helper automatically re-mints the token via Identity Toolkit (`signInWithEmailAndPassword`) if
+ * session credentials are available, or cleanly signs out stale expired IndexedDB sessions.
+ */
+export async function ensureValidAuthTokenForFirestore(options?: {
+  requireVerifiedClaim?: boolean;
+  requireEmailVerifiedClaim?: boolean;
+}): Promise<boolean> {
+  if (!auth.currentUser) return false;
+  patchFirebaseUserTokenManager(auth.currentUser);
+
+  const mustHaveVerifiedClaim = Boolean(
+    options?.requireVerifiedClaim || options?.requireEmailVerifiedClaim
+  );
+  const creds = getEphemeralSessionAuth();
+
+  // Inspect cached stsTokenManager token before triggering getIdToken
+  const rawUser = auth.currentUser as unknown as {
+    stsTokenManager?: { accessToken?: string };
+  };
+  const cachedAccessToken = rawUser?.stsTokenManager?.accessToken;
+  if (cachedAccessToken) {
+    const cachedPayload = decodeJwtPayload(cachedAccessToken);
+    if (
+      cachedPayload?.exp !== undefined &&
+      cachedPayload.exp * 1000 <= Date.now() + 30000 &&
+      !creds
+    ) {
+      await signOutFromCloud().catch(() => {});
+      return false;
+    }
+  }
+
+  let token: string | null = null;
+
+  try {
+    token = await auth.currentUser.getIdToken(false);
+  } catch (err) {
+    if (creds) {
+      try {
+        const reauthed = await signInWithEmailAndPassword(
+          auth,
+          creds.email,
+          creds.password
+        );
+        token = await reauthed.user.getIdToken(false);
+      } catch {
+        token = null;
+      }
+    }
+    if (!token && isTokenServiceDisabledError(err)) {
+      await signOutFromCloud().catch(() => {});
+      return false;
+    }
+    if (!token) return false;
+  }
+
+  const payload = decodeJwtPayload(token);
+  const nowMs = Date.now();
+  const isExpiredOrExpiring =
+    payload?.exp !== undefined && payload.exp * 1000 <= nowMs + 30000;
+
+  if (isExpiredOrExpiring) {
+    if (creds) {
+      try {
+        const reauthed = await signInWithEmailAndPassword(
+          auth,
+          creds.email,
+          creds.password
+        );
+        token = await reauthed.user.getIdToken(false);
+      } catch {
+        await signOutFromCloud().catch(() => {});
+        return false;
+      }
+    } else {
+      await signOutFromCloud().catch(() => {});
+      return false;
+    }
+  }
+
+  const latestPayload = token ? decodeJwtPayload(token) : null;
+  if (
+    (mustHaveVerifiedClaim || auth.currentUser?.emailVerified) &&
+    latestPayload?.email_verified !== true
+  ) {
+    if (creds) {
+      try {
+        const reauthed = await signInWithEmailAndPassword(
+          auth,
+          creds.email,
+          creds.password
+        );
+        const refreshedToken = await reauthed.user.getIdToken(false);
+        const refreshedPayload = decodeJwtPayload(refreshedToken);
+        if (mustHaveVerifiedClaim && refreshedPayload?.email_verified !== true) {
+          return false;
+        }
+        return true;
+      } catch {
+        if (mustHaveVerifiedClaim) return false;
+      }
+    } else if (mustHaveVerifiedClaim) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+export async function handleEmailVerificationActionUrl(): Promise<{
+  handled: boolean;
+  verified: boolean;
+  message?: string;
+}> {
+  if (typeof window === 'undefined') {
+    return { handled: false, verified: false };
+  }
+  const params = new URLSearchParams(window.location.search);
+  const mode = params.get('mode');
+  const oobCode = params.get('oobCode');
+
+  if (mode !== 'verifyEmail' || !oobCode) {
+    return { handled: false, verified: false };
+  }
+
+  try {
+    await applyActionCode(auth, oobCode);
+    // Clean URL query params so reload doesn't re-apply a consumed oobCode
+    const cleanUrl = `${window.location.origin}${window.location.pathname}${window.location.hash}`;
+    window.history.replaceState({}, document.title, cleanUrl);
+    await reloadAndCheckCurrentUser();
+    return {
+      handled: true,
+      verified: true,
+      message:
+        'تم تفعيل وتأكيد بريدك الإلكتروني بنجاح عبر رابط التحقق من Firebase Authentication ✅',
+    };
+  } catch (err) {
+    const cleanUrl = `${window.location.origin}${window.location.pathname}${window.location.hash}`;
+    window.history.replaceState({}, document.title, cleanUrl);
+    return {
+      handled: true,
+      verified: false,
+      message: translateFirebaseAuthError(err),
+    };
+  }
+}
+
 export async function signInWithGoogleCloud(): Promise<User> {
   const cred = await signInWithPopup(auth, googleProvider);
+  patchFirebaseUserTokenManager(cred.user);
   return cred.user;
 }
 
@@ -534,7 +902,8 @@ export async function registerWithEmailAndPasswordCloud(params: {
     cleanEmail,
     params.password
   );
-  ephemeralSessionAuth = { email: cleanEmail, password: params.password };
+  saveEphemeralSessionAuth(cleanEmail, params.password);
+  patchFirebaseUserTokenManager(cred.user);
   if (params.displayName.trim()) {
     await updateProfile(cred.user, {
       displayName: params.displayName.trim().slice(0, 80),
@@ -550,7 +919,8 @@ export async function loginWithEmailAndPasswordCloud(
 ): Promise<User> {
   const cleanEmail = email.trim().toLowerCase();
   const cred = await signInWithEmailAndPassword(auth, cleanEmail, password);
-  ephemeralSessionAuth = { email: cleanEmail, password };
+  saveEphemeralSessionAuth(cleanEmail, password);
+  patchFirebaseUserTokenManager(cred.user);
   return cred.user;
 }
 
@@ -576,16 +946,18 @@ export async function sendPasswordResetEmailCloud(email: string): Promise<void> 
  */
 export async function reloadAndCheckCurrentUser(): Promise<User | null> {
   if (!auth.currentUser) return null;
+  patchFirebaseUserTokenManager(auth.currentUser);
+  const creds = getEphemeralSessionAuth();
 
   try {
     await auth.currentUser.reload();
   } catch (reloadErr) {
-    if (isTokenServiceDisabledError(reloadErr) && ephemeralSessionAuth) {
+    if (isTokenServiceDisabledError(reloadErr) && creds) {
       try {
         const reauthed = await signInWithEmailAndPassword(
           auth,
-          ephemeralSessionAuth.email,
-          ephemeralSessionAuth.password
+          creds.email,
+          creds.password
         );
         return reauthed.user;
       } catch {
@@ -597,41 +969,10 @@ export async function reloadAndCheckCurrentUser(): Promise<User | null> {
     }
   }
 
-  // If the user just verified their email, attempt to refresh claims safely:
-  // Avoid crashing if securetoken.googleapis.com is disabled on Starter Tier.
   if (auth.currentUser) {
-    try {
-      await auth.currentUser.getIdToken(false);
-    } catch (tokenErr) {
-      if (isTokenServiceDisabledError(tokenErr) && ephemeralSessionAuth) {
-        try {
-          const reauthed = await signInWithEmailAndPassword(
-            auth,
-            ephemeralSessionAuth.email,
-            ephemeralSessionAuth.password
-          );
-          return reauthed.user;
-        } catch {
-          // ignore fallback error
-        }
-      }
-    }
-
-    // If emailVerified became true on the server, re-mint idToken via Identity Toolkit
-    // if ephemeralSessionAuth is available so Firestore rules see email_verified == true
-    // without calling securetoken.googleapis.com.
-    if (auth.currentUser.emailVerified && ephemeralSessionAuth) {
-      try {
-        const reauthed = await signInWithEmailAndPassword(
-          auth,
-          ephemeralSessionAuth.email,
-          ephemeralSessionAuth.password
-        );
-        return reauthed.user;
-      } catch {
-        // ignore and return current user
-      }
-    }
+    await ensureValidAuthTokenForFirestore({
+      requireVerifiedClaim: Boolean(auth.currentUser.emailVerified),
+    });
   }
 
   return auth.currentUser;
@@ -860,6 +1201,7 @@ export async function confirmPhoneOtpViaFirebase(
     throw { code: 'auth/invalid-verification-code' };
   }
   const result = await confirmationResult.confirm(cleanCode);
+  patchFirebaseUserTokenManager(result.user);
   // IMPORTANT: Do NOT call getIdToken(true) here because confirmationResult.confirm()
   // already returns a brand-new idToken from identitytoolkit.googleapis.com, whereas
   // getIdToken(true) forces a call to securetoken.googleapis.com which is disabled in
@@ -878,7 +1220,7 @@ export async function confirmPhoneOtpViaFirebase(
 }
 
 export async function signOutFromCloud(): Promise<void> {
-  ephemeralSessionAuth = null;
+  clearEphemeralSessionAuth();
   clearRecaptchaVerifier();
   await signOut(auth);
 }
@@ -890,7 +1232,19 @@ export async function logoutFromFirebase(): Promise<void> {
 export function subscribeToAuthChanges(
   callback: (user: User | null) => void
 ): () => void {
-  return onAuthStateChanged(auth, callback);
+  return onAuthStateChanged(auth, async (fbUser) => {
+    if (!fbUser) {
+      callback(null);
+      return;
+    }
+    patchFirebaseUserTokenManager(fbUser);
+    const hasValidToken = await ensureValidAuthTokenForFirestore();
+    if (!hasValidToken || !auth.currentUser) {
+      callback(null);
+      return;
+    }
+    callback(auth.currentUser);
+  });
 }
 
 // ============================================================================
@@ -928,20 +1282,23 @@ export async function checkUsernameAvailability(
     return { available: false };
   }
 
-  // 1. If authenticated in Firebase, query Firestore /usernames/{username} directly
+  // 1. If authenticated in Firebase with a valid token, query Firestore /usernames/{username} directly
   if (auth.currentUser) {
-    const path = `usernames/${cleanUsername}`;
-    try {
-      const snap = await getDocFromServer(doc(db, 'usernames', cleanUsername));
-      if (snap.exists()) {
-        const ownerUid = String(snap.data().uid || '');
-        if (currentUid && ownerUid === currentUid) {
-          return { available: true, ownerUid };
+    const hasValidToken = await ensureValidAuthTokenForFirestore();
+    if (hasValidToken && auth.currentUser) {
+      const path = `usernames/${cleanUsername}`;
+      try {
+        const snap = await getDoc(doc(db, 'usernames', cleanUsername));
+        if (snap.exists()) {
+          const ownerUid = String(snap.data().uid || '');
+          if (currentUid && ownerUid === currentUid) {
+            return { available: true, ownerUid };
+          }
+          return { available: false, ownerUid };
         }
-        return { available: false, ownerUid };
+      } catch (error) {
+        handleFirestoreError(error, OperationType.GET, path);
       }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.GET, path);
     }
   }
 
@@ -979,7 +1336,14 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
   phoneVerified: boolean;
   avatarFallbackColor?: string;
 }): Promise<FirestoreUserProfileData> {
-  const uid = params.user.uid;
+  const hasVerifiedToken = await ensureValidAuthTokenForFirestore({
+    requireVerifiedClaim: true,
+  });
+  if (!hasVerifiedToken || !auth.currentUser) {
+    throw new Error('TOKEN_NEEDS_RELOGIN_FOR_VERIFIED_CLAIM');
+  }
+
+  const uid = auth.currentUser.uid;
   const cleanUsername = sanitizeUsername(params.username);
   if (!isValidUsernameFormat(cleanUsername)) {
     throw new Error(
@@ -987,15 +1351,17 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
     );
   }
 
-  const safeDisplayName = (params.displayName || cleanUsername)
+  const safeDisplayName = (params.displayName || cleanUsername || 'مستخدم')
     .trim()
     .slice(0, 80);
-  const safeEmail = (params.user.email || params.email || '')
+  const rawEmail = (auth.currentUser.email || params.user.email || params.email || '')
     .trim()
     .toLowerCase()
     .slice(0, 120);
+  const safeEmail =
+    rawEmail.length >= 5 ? rawEmail : `${cleanUsername}@sahpy.chat`.slice(0, 120);
   const safePhone = sanitizePhoneTag(
-    params.user.phoneNumber || params.phoneTag
+    auth.currentUser.phoneNumber || params.user.phoneNumber || params.phoneTag
   );
   const safeBio = (params.bio || 'متاح للمحادثة عبر SAHPY-CHAT ✨')
     .trim()
@@ -1004,22 +1370,65 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
     0,
     40
   );
-  const emailVerified = Boolean(params.user.emailVerified);
+  const emailVerified = Boolean(auth.currentUser.emailVerified || params.user.emailVerified);
   const phoneVerified = Boolean(
-    params.phoneVerified || params.user.phoneNumber
+    params.phoneVerified || auth.currentUser.phoneNumber || params.user.phoneNumber
   );
 
-  const usernameRef = doc(db, 'usernames', cleanUsername);
   const userRef = doc(db, 'users', uid);
   const dirRef = doc(db, 'directory', uid);
+
+  // If a legacy user document exists from an older schema (missing uid/createdAt/wallpaperTheme),
+  // clean it up first so the transaction creates a strictly compliant UserProfile document.
+  try {
+    const existingUserSnap = await getDoc(userRef);
+    if (existingUserSnap.exists()) {
+      const uData = existingUserSnap.data();
+      const hasLegacyShape =
+        !uData.uid ||
+        !uData.username ||
+        !uData.email ||
+        !uData.wallpaperTheme ||
+        !uData.createdAt ||
+        'name' in uData ||
+        'phone' in uData ||
+        'avatar' in uData;
+      if (hasLegacyShape) {
+        await deleteDoc(userRef);
+      }
+    }
+    const existingDirSnap = await getDoc(dirRef);
+    if (existingDirSnap.exists()) {
+      const dData = existingDirSnap.data();
+      const hasLegacyDirShape =
+        !dData.uid ||
+        !dData.username ||
+        !dData.avatarFallbackColor ||
+        !dData.createdAt;
+      if (hasLegacyDirShape) {
+        await deleteDoc(dirRef);
+      }
+    }
+  } catch {
+    // ignore pre-migration check error
+  }
 
   let resolvedUsername = cleanUsername;
 
   try {
     await runTransaction(db, async (transaction) => {
-      const usernameSnap = await transaction.get(usernameRef);
       const userSnap = await transaction.get(userRef);
       const dirSnap = await transaction.get(dirRef);
+
+      // If the user already had an older username in a valid UserProfile doc, keep their immutable username
+      const effectiveUsername =
+        userSnap.exists() && userSnap.data().username
+          ? String(userSnap.data().username)
+          : cleanUsername;
+      resolvedUsername = effectiveUsername;
+
+      const effectiveUsernameRef = doc(db, 'usernames', effectiveUsername);
+      const usernameSnap = await transaction.get(effectiveUsernameRef);
 
       if (usernameSnap.exists()) {
         const existingOwnerUid = String(usernameSnap.data().uid || '');
@@ -1028,15 +1437,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
         }
       }
 
-      // If the user already had an older username, keep their immutable username
-      const effectiveUsername = userSnap.exists()
-        ? String(userSnap.data().username || cleanUsername)
-        : cleanUsername;
-      resolvedUsername = effectiveUsername;
-
-      const effectiveUsernameRef = doc(db, 'usernames', effectiveUsername);
-
-      if (!usernameSnap.exists() && effectiveUsername === cleanUsername) {
+      if (!usernameSnap.exists()) {
         transaction.set(effectiveUsernameRef, {
           uid,
           username: effectiveUsername,
@@ -1046,7 +1447,7 @@ export async function reserveUsernameAndSaveProfileToFirestore(params: {
           createdAt: serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
-      } else if (effectiveUsername === cleanUsername) {
+      } else {
         transaction.update(effectiveUsernameRef, {
           displayName: safeDisplayName,
           bio: safeBio,
@@ -1130,21 +1531,25 @@ export async function getOwnUserProfileFromFirestore(
   uid: string
 ): Promise<FirestoreUserProfileData | null> {
   if (!auth.currentUser || auth.currentUser.uid !== uid) return null;
+  const hasValidToken = await ensureValidAuthTokenForFirestore();
+  if (!hasValidToken || !auth.currentUser || auth.currentUser.uid !== uid) {
+    return null;
+  }
   const path = `users/${uid}`;
   try {
-    const snap = await getDocFromServer(doc(db, 'users', uid));
+    const snap = await getDoc(doc(db, 'users', uid));
     if (!snap.exists()) return null;
     const d = snap.data();
     return {
       uid: String(d.uid || uid),
-      displayName: String(d.displayName || ''),
+      displayName: String(d.displayName || d.name || ''),
       username: String(d.username || ''),
-      email: String(d.email || ''),
-      phoneTag: String(d.phoneTag || ''),
+      email: String(d.email || auth.currentUser?.email || ''),
+      phoneTag: String(d.phoneTag || d.phone || ''),
       bio: String(d.bio || ''),
       wallpaperTheme: (d.wallpaperTheme as WallpaperThemeId) || 'aurora-borealis',
-      emailVerified: Boolean(d.emailVerified),
-      phoneVerified: Boolean(d.phoneVerified),
+      emailVerified: Boolean(d.emailVerified ?? auth.currentUser?.emailVerified),
+      phoneVerified: Boolean(d.phoneVerified ?? auth.currentUser?.phoneNumber),
     };
   } catch (error) {
     handleFirestoreError(error, OperationType.GET, path);
@@ -1159,6 +1564,9 @@ export async function findRegisteredUserInFirestore(
   rawQuery: string
 ): Promise<PublicDirectoryUser | null> {
   if (!auth.currentUser) return null;
+  const hasValidToken = await ensureValidAuthTokenForFirestore();
+  if (!hasValidToken || !auth.currentUser) return null;
+
   const trimmed = String(rawQuery || '').trim();
   if (!trimmed) return null;
 
@@ -1167,13 +1575,11 @@ export async function findRegisteredUserInFirestore(
   if (isValidUsernameFormat(candidateUsername)) {
     const usernamePath = `usernames/${candidateUsername}`;
     try {
-      const unameSnap = await getDocFromServer(
-        doc(db, 'usernames', candidateUsername)
-      );
+      const unameSnap = await getDoc(doc(db, 'usernames', candidateUsername));
       if (unameSnap.exists()) {
         const targetUid = String(unameSnap.data().uid || '');
         if (targetUid) {
-          const dirSnap = await getDocFromServer(doc(db, 'directory', targetUid));
+          const dirSnap = await getDoc(doc(db, 'directory', targetUid));
           if (dirSnap.exists()) {
             const d = dirSnap.data();
             return {
@@ -1213,7 +1619,7 @@ export async function findRegisteredUserInFirestore(
   if (/^[a-zA-Z0-9_-]{6,128}$/.test(candidateUid)) {
     const dirPath = `directory/${candidateUid}`;
     try {
-      const dirSnap = await getDocFromServer(doc(db, 'directory', candidateUid));
+      const dirSnap = await getDoc(doc(db, 'directory', candidateUid));
       if (dirSnap.exists()) {
         const d = dirSnap.data();
         return {
@@ -1265,6 +1671,14 @@ export async function createOrGetAuthorizedChatRoom(params: {
   if (params.myUid === params.otherUid) {
     throw new Error('لا يمكنك إنشاء محادثة مع نفسك.');
   }
+  const hasValidToken = await ensureValidAuthTokenForFirestore({
+    requireEmailVerifiedClaim: true,
+  });
+  if (!hasValidToken || !auth.currentUser) {
+    throw new Error(
+      'تم تأكيد البريد الإلكتروني، ولكن يلزم تسجيل الدخول مرة أخرى لتحديث جلسة الأمان قبل بدء المحادثة.'
+    );
+  }
 
   const chatId = buildDeterministicChatId(params.myUid, params.otherUid);
   const chatPath = `chats/${chatId}`;
@@ -1288,9 +1702,7 @@ export async function createOrGetAuthorizedChatRoom(params: {
 
   try {
     // Verify target user exists in /directory/{otherUid}
-    const targetDirSnap = await getDocFromServer(
-      doc(db, 'directory', params.otherUid)
-    );
+    const targetDirSnap = await getDoc(doc(db, 'directory', params.otherUid));
     if (!targetDirSnap.exists()) {
       throw new Error(
         'هذا المستخدم غير موجود في قاعدة بيانات Firestore المعتمدة.'
@@ -1343,6 +1755,14 @@ export async function sendAuthorizedMessageToChatRoom(params: {
   }
   if (!auth.currentUser.emailVerified) {
     throw new Error('يرجى تأكيد البريد الإلكتروني أولاً قبل إرسال الرسائل.');
+  }
+  const hasValidToken = await ensureValidAuthTokenForFirestore({
+    requireEmailVerifiedClaim: true,
+  });
+  if (!hasValidToken || !auth.currentUser) {
+    throw new Error(
+      'يرجى تسجيل الدخول مرة أخرى لتحديث جلسة الأمان قبل إرسال الرسائل.'
+    );
   }
 
   const safeChatId = sanitizeDocId(params.chatId);
@@ -1557,6 +1977,11 @@ export async function saveContactToFirestore(
   contact: Contact
 ): Promise<void> {
   if (!auth.currentUser || !auth.currentUser.emailVerified) return;
+  const hasValidToken = await ensureValidAuthTokenForFirestore({
+    requireEmailVerifiedClaim: true,
+  });
+  if (!hasValidToken || !auth.currentUser) return;
+
   const safeContactId = sanitizeDocId(contact.id);
   const path = `users/${uid}/contacts/${safeContactId}`;
   const contactRef = doc(db, 'users', uid, 'contacts', safeContactId);
@@ -1573,7 +1998,10 @@ export async function saveContactToFirestore(
   );
 
   try {
-    const snap = await getDocFromServer(contactRef);
+    const parentUserSnap = await getDoc(doc(db, 'users', uid));
+    if (!parentUserSnap.exists()) return;
+
+    const snap = await getDoc(contactRef);
     if (!snap.exists()) {
       await setDoc(contactRef, {
         ownerUid: uid,
@@ -1609,6 +2037,11 @@ export async function saveMessageToFirestore(
   fallbackSenderName: string
 ): Promise<void> {
   if (!auth.currentUser || !auth.currentUser.emailVerified) return;
+  const hasValidToken = await ensureValidAuthTokenForFirestore({
+    requireEmailVerifiedClaim: true,
+  });
+  if (!hasValidToken || !auth.currentUser) return;
+
   const safeContactId = sanitizeDocId(contactId);
   const safeMsgId = sanitizeDocId(message.id);
   const path = `users/${uid}/contacts/${safeContactId}/messages/${safeMsgId}`;
@@ -1665,6 +2098,11 @@ export async function updateMessageFlagsInFirestore(
   isPinned: boolean
 ): Promise<void> {
   if (!auth.currentUser || !auth.currentUser.emailVerified) return;
+  const hasValidToken = await ensureValidAuthTokenForFirestore({
+    requireEmailVerifiedClaim: true,
+  });
+  if (!hasValidToken || !auth.currentUser) return;
+
   const safeContactId = sanitizeDocId(contactId);
   const safeMsgId = sanitizeDocId(messageId);
   const path = `users/${uid}/contacts/${safeContactId}/messages/${safeMsgId}`;
@@ -1695,6 +2133,11 @@ export async function deleteMessageFromFirestore(
   messageId: string
 ): Promise<void> {
   if (!auth.currentUser || !auth.currentUser.emailVerified) return;
+  const hasValidToken = await ensureValidAuthTokenForFirestore({
+    requireEmailVerifiedClaim: true,
+  });
+  if (!hasValidToken || !auth.currentUser) return;
+
   const safeContactId = sanitizeDocId(contactId);
   const safeMsgId = sanitizeDocId(messageId);
   const path = `users/${uid}/contacts/${safeContactId}/messages/${safeMsgId}`;
@@ -1955,10 +2398,21 @@ export async function syncUserToFirestore(user: {
   phoneVerified?: boolean;
 }): Promise<void> {
   if (!auth.currentUser || !auth.currentUser.emailVerified) return;
-  const cleanUser =
+  const uid = auth.currentUser.uid;
+  let cleanUser =
     sanitizeUsername(user.username || '') ||
     sanitizeUsername((auth.currentUser.email || '').split('@')[0]) ||
-    `user_${auth.currentUser.uid.slice(0, 6).toLowerCase()}`;
+    `user_${uid.slice(0, 6).toLowerCase()}`;
+
+  const avail = await checkUsernameAvailability(cleanUser, uid).catch(() => ({
+    available: true,
+  }));
+  if (!avail.available) {
+    cleanUser = sanitizeUsername(
+      `${cleanUser.slice(0, 20)}_${uid.slice(0, 5).toLowerCase()}`
+    );
+  }
+
   await reserveUsernameAndSaveProfileToFirestore({
     user: auth.currentUser,
     displayName: user.name,
