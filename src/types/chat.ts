@@ -61,6 +61,8 @@ export interface Message {
   isStarred?: boolean;
   isPinned?: boolean;
   createdAtMs?: number;
+  isEdited?: boolean;
+  editedAt?: number | string;
 }
 
 export interface SharedMediaItem {

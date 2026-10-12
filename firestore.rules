@@ -361,6 +361,8 @@ service cloud.firestore {
           'displayTime',
           'isStarred',
           'isPinned',
+          'isEdited',
+          'editedAt',
           'createdAt',
           'updatedAt'
         ])
@@ -406,6 +408,8 @@ service cloud.firestore {
         && (!('stickerLabel' in data) || (data.stickerLabel is string && data.stickerLabel.size() <= 100))
         && (!('stickerGradient' in data) || (data.stickerGradient is string && data.stickerGradient.size() <= 160))
         && (!('stickerPackId' in data) || (data.stickerPackId is string && data.stickerPackId.size() <= 40))
+        && (!('isEdited' in data) || data.isEdited is bool)
+        && (!('editedAt' in data) || data.editedAt is timestamp)
         && data.displayTime is string
         && data.displayTime.size() >= 1
         && data.displayTime.size() <= 40
@@ -496,6 +500,8 @@ service cloud.firestore {
           'displayTime',
           'isStarred',
           'isPinned',
+          'isEdited',
+          'editedAt',
           'createdAt',
           'updatedAt'
         ])
@@ -527,6 +533,8 @@ service cloud.firestore {
           data.messageType == 'poll' ||
           data.messageType == 'sticker'
         )
+        && (!('isEdited' in data) || data.isEdited is bool)
+        && (!('editedAt' in data) || data.editedAt is timestamp)
         && data.displayTime is string
         && data.displayTime.size() >= 1
         && data.displayTime.size() <= 40
@@ -581,13 +589,20 @@ service cloud.firestore {
         && request.auth.uid == userId
         && isValidUserProfile(incoming())
         && incoming().uid == existing().uid
-        && incoming().username == existing().username
-        && incoming().email == existing().email
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
+          incoming().username == existing().username ||
+          (
+            exists(/databases/$(database)/documents/usernames/$(incoming().username)) &&
+            get(/databases/$(database)/documents/usernames/$(incoming().username)).data.uid == request.auth.uid
+          )
+        )
+        && (
           incoming().diff(existing()).affectedKeys().hasOnly([
             'displayName',
+            'username',
+            'email',
             'phoneTag',
             'bio',
             'wallpaperTheme',
@@ -691,16 +706,30 @@ service cloud.firestore {
             && incoming().ownerUid == existing().ownerUid
             && incoming().contactId == existing().contactId
             && incoming().senderRole == existing().senderRole
-            && incoming().text == existing().text
             && incoming().createdAt == existing().createdAt
             && incoming().updatedAt == request.time
             && isParentContactOwner(userId, contactId)
             && (
-              incoming().diff(existing()).affectedKeys().hasOnly([
-                'isStarred',
-                'isPinned',
-                'updatedAt'
-              ])
+              (
+                incoming().text == existing().text &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'isStarred',
+                  'isPinned',
+                  'updatedAt'
+                ])
+              ) || (
+                existing().senderRole == 'me' &&
+                existing().messageType == 'text' &&
+                incoming().text is string &&
+                incoming().text.size() >= 1 &&
+                incoming().text.size() <= 2000 &&
+                incoming().diff(existing()).affectedKeys().hasOnly([
+                  'text',
+                  'isEdited',
+                  'editedAt',
+                  'updatedAt'
+                ])
+              )
             );
 
           allow delete: if isVerifiedUser()
@@ -734,12 +763,12 @@ service cloud.firestore {
         && request.auth.uid == userId
         && isValidPublicDirectoryProfile(incoming())
         && incoming().uid == existing().uid
-        && incoming().username == existing().username
         && incoming().createdAt == existing().createdAt
         && incoming().updatedAt == request.time
         && (
           incoming().diff(existing()).affectedKeys().hasOnly([
             'displayName',
+            'username',
             'bio',
             'avatarFallbackColor',
             'emailVerified',
@@ -944,18 +973,32 @@ service cloud.firestore {
           && incoming().recipientUid == existing().recipientUid
           && incoming().senderName == existing().senderName
           && incoming().senderUsername == existing().senderUsername
-          && incoming().text == existing().text
           && incoming().messageType == existing().messageType
           && incoming().displayTime == existing().displayTime
           && incoming().createdAt == existing().createdAt
           && incoming().updatedAt == request.time
           && isAuthorizedChatParticipant(chatId)
           && (
-            incoming().diff(existing()).affectedKeys().hasOnly([
-              'isStarred',
-              'isPinned',
-              'updatedAt'
-            ])
+            (
+              incoming().text == existing().text &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'isStarred',
+                'isPinned',
+                'updatedAt'
+              ])
+            ) || (
+              existing().senderUid == request.auth.uid &&
+              existing().messageType == 'text' &&
+              incoming().text is string &&
+              incoming().text.size() >= 1 &&
+              incoming().text.size() <= 2000 &&
+              incoming().diff(existing()).affectedKeys().hasOnly([
+                'text',
+                'isEdited',
+                'editedAt',
+                'updatedAt'
+              ])
+            )
           );
 
         allow delete: if isVerifiedUser()
@@ -966,6 +1009,38 @@ service cloud.firestore {
             existing().recipientUid == request.auth.uid
           )
           && isAuthorizedChatParticipant(chatId);
+      }
+
+      // Subcollection 6: /chats/{chatId}/typing/{userId} (Realtime Typing Indicator)
+      match /typing/{userId} {
+        allow get, list: if isSignedIn()
+          && isValidId(chatId)
+          && (
+            isAuthorizedChatParticipant(chatId) ||
+            chatId.matches('^' + request.auth.uid + '_[A-Za-z0-9_\\-]{1,128}$') ||
+            chatId.matches('^[A-Za-z0-9_\\-]{1,128}_' + request.auth.uid + '$')
+          );
+
+        allow create, update: if isSignedIn()
+          && isValidId(chatId)
+          && isValidId(userId)
+          && userId == request.auth.uid
+          && (
+            isAuthorizedChatParticipant(chatId) ||
+            chatId.matches('^' + request.auth.uid + '_[A-Za-z0-9_\\-]{1,128}$') ||
+            chatId.matches('^[A-Za-z0-9_\\-]{1,128}_' + request.auth.uid + '$')
+          )
+          && incoming().keys().hasAll(['chatId', 'uid', 'isTyping', 'updatedAt'])
+          && incoming().keys().hasOnly(['chatId', 'uid', 'isTyping', 'updatedAt'])
+          && incoming().chatId == chatId
+          && incoming().uid == request.auth.uid
+          && incoming().isTyping is bool
+          && incoming().updatedAt == request.time;
+
+        allow delete: if isSignedIn()
+          && isValidId(chatId)
+          && isValidId(userId)
+          && userId == request.auth.uid;
       }
     }
   }

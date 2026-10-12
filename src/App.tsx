@@ -39,6 +39,7 @@ import {
   Film,
   Clock,
   Sticker,
+  Pencil,
 } from 'lucide-react';
 import {
   Contact,
@@ -98,6 +99,10 @@ import {
   clearAuthorizedChatMessagesInFirestore,
   deleteSavedContactFromFirestore,
   subscribeToSavedContacts,
+  editDirectMessageInFirestore,
+  changeUsernameInFirestore,
+  setTypingStatusInFirestore,
+  subscribeToTypingStatusInFirestore,
 } from './lib/firebase';
 
 import ahmedAvatar from './assets/images/avatar_ahmed_profile_1791581695415.jpg';
@@ -423,6 +428,7 @@ export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
 
   const [selectedContactId, setSelectedContactId] = useState<string>('');
+  const [isOtherUserTyping, setIsOtherUserTyping] = useState<boolean>(false);
   const [mobileShowChat, setMobileShowChat] = useState<boolean>(false);
 
   // Group Chat sender identity simulator (allows sending as yourself or testing multi-member replies)
@@ -439,6 +445,11 @@ export default function App() {
   // Composer State
   const [inputText, setInputText] = useState('');
   const [replyingTo, setReplyingTo] = useState<Message | null>(null);
+  const [editingMessage, setEditingMessage] = useState<{
+    id: string;
+    text: string;
+    contactId: string;
+  } | null>(null);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [pickerTab, setPickerTab] = useState<'emojis' | 'stickers'>('stickers');
   const [selectedStickerPack, setSelectedStickerPack] = useState<
@@ -1223,6 +1234,17 @@ export default function App() {
               })
             );
           }
+        } else if (data.type === 'message:edit' && data.messageId) {
+          setContacts((prev) =>
+            prev.map((c) => ({
+              ...c,
+              messages: c.messages.map((m) =>
+                m.id === data.messageId
+                  ? { ...m, text: data.text, isEdited: true }
+                  : m
+              ),
+            }))
+          );
         } else if (data.type === 'story:new' && data.story) {
           setStories((prev) => {
             if (prev.some((s) => s.id === data.story.id)) return prev;
@@ -1394,6 +1416,7 @@ export default function App() {
               reactions: existingById.get(cm.id)?.reactions || [],
               isStarred: existingById.get(cm.id)?.isStarred,
               replyTo: existingById.get(cm.id)?.replyTo,
+              isEdited: Boolean((cm as any).isEdited || existingById.get(cm.id)?.isEdited),
             };
 
             const prevMsg = existingById.get(cm.id);
@@ -1401,11 +1424,17 @@ export default function App() {
               changed = true;
               existingById.set(cm.id, formatted);
             } else if (
-              prevMsg.type === 'voice' &&
-              (!prevMsg.voiceDuration || prevMsg.voiceDuration === 'undefined')
+              prevMsg.text !== formatted.text ||
+              prevMsg.isEdited !== formatted.isEdited ||
+              (prevMsg.type === 'voice' && (!prevMsg.voiceDuration || prevMsg.voiceDuration === 'undefined'))
             ) {
               changed = true;
-              existingById.set(cm.id, { ...prevMsg, voiceDuration: safeVoiceDur });
+              existingById.set(cm.id, {
+                ...prevMsg,
+                text: formatted.text,
+                isEdited: formatted.isEdited,
+                voiceDuration: prevMsg.type === 'voice' ? safeVoiceDur : prevMsg.voiceDuration,
+              });
             }
           });
 
@@ -1432,6 +1461,50 @@ export default function App() {
     selectedContact?.chatId,
     selectedContact?.isGroup,
     clearedChatsMap,
+  ]);
+
+  // Subscribe to real-time Firestore typing indicator for active chat room
+  useEffect(() => {
+    setIsOtherUserTyping(false);
+    const myUid = currentUserUid || auth.currentUser?.uid;
+    const targetUid =
+      selectedContact?.uid ||
+      (!selectedContact?.isGroup && !DEMO_CONTACT_IDS.has(selectedContact?.id)
+        ? selectedContact?.id
+        : '');
+    if (!myUid || !targetUid || selectedContact?.isGroup || myUid === targetUid) {
+      return;
+    }
+    const chatId =
+      selectedContact?.chatId || getDeterministicChatId(myUid, targetUid);
+
+    const unsubTyping = subscribeToTypingStatusInFirestore(
+      chatId,
+      targetUid,
+      (isOtherTyping) => {
+        setIsOtherUserTyping(isOtherTyping);
+        setContacts((prev) =>
+          prev.map((c) => {
+            if (c.id === selectedContact.id || c.uid === targetUid) {
+              if (c.isTyping === isOtherTyping) return c;
+              return { ...c, isTyping: isOtherTyping };
+            }
+            return c;
+          })
+        );
+      }
+    );
+
+    return () => {
+      setIsOtherUserTyping(false);
+      unsubTyping();
+    };
+  }, [
+    currentUserUid,
+    selectedContact?.id,
+    selectedContact?.uid,
+    selectedContact?.chatId,
+    selectedContact?.isGroup,
   ]);
 
   // Subscribe to all authorized Firestore 1-on-1 chat rooms where current user is a participant
@@ -1918,6 +1991,7 @@ export default function App() {
 
   // Select Contact Handler
   const handleSelectContact = (contactId: string) => {
+    stopTypingNow();
     setSelectedContactId(contactId);
     setMobileShowChat(true);
     setActiveHeaderMenu(false);
@@ -2093,9 +2167,135 @@ export default function App() {
     );
   };
 
+  // Start Editing an existing text message
+  const handleStartEditMessage = (msg: Message) => {
+    if (msg.type !== 'text') return;
+    setReplyingTo(null);
+    setEditingMessage({
+      id: msg.id,
+      text: msg.text,
+      contactId: selectedContactId,
+    });
+    setInputText(msg.text);
+  };
+
+  // Cancel Editing
+  const handleCancelEditMessage = () => {
+    setEditingMessage(null);
+    setInputText('');
+  };
+
+  // Save Message Edit (Updates Local State, Server PUT, and Firestore)
+  const handleSaveEditMessage = async () => {
+    if (!editingMessage || !selectedContact) return;
+    const trimmedText = inputText.trim();
+    if (!trimmedText) {
+      triggerToast('نص الرسالة لا يمكن أن يكون فارغاً.');
+      return;
+    }
+    const msgId = editingMessage.id;
+    const targetContact = selectedContact;
+
+    // Optimistically update
+    setContacts((prev) =>
+      prev.map((c) =>
+        c.id === targetContact.id
+          ? {
+              ...c,
+              messages: c.messages.map((m) =>
+                m.id === msgId ? { ...m, text: trimmedText, isEdited: true } : m
+              ),
+            }
+          : c
+      )
+    );
+    setEditingMessage(null);
+    setInputText('');
+    triggerToast('تم تعديل الرسالة بنجاح ✏️');
+
+    // Update on Backend
+    fetch(`/api/messages/${msgId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: trimmedText }),
+    }).catch(() => {});
+
+    // Update in Firestore
+    const myUid = currentUserUid || auth.currentUser?.uid || '';
+    const otherUid =
+      targetContact.uid ||
+      (!targetContact.isGroup && !DEMO_CONTACT_IDS.has(targetContact.id)
+        ? targetContact.id
+        : '');
+    await editDirectMessageInFirestore({
+      myUid,
+      otherUid,
+      chatId: targetContact.chatId,
+      messageId: msgId,
+      newText: trimmedText,
+    }).catch(() => {});
+  };
+
+  // Real-time Firestore Typing State & Timers
+  const typingInactivityTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const isCurrentlyMarkedTypingRef = useRef<boolean>(false);
+  const activeChatIdForTypingRef = useRef<string>('');
+
+  const stopTypingNow = useCallback(() => {
+    if (typingInactivityTimerRef.current) {
+      clearTimeout(typingInactivityTimerRef.current);
+      typingInactivityTimerRef.current = null;
+    }
+    if (isCurrentlyMarkedTypingRef.current) {
+      const myUid = currentUserUid || auth.currentUser?.uid;
+      const targetChatId = activeChatIdForTypingRef.current;
+      if (myUid && targetChatId) {
+        setTypingStatusInFirestore(targetChatId, myUid, false).catch(() => {});
+      }
+      isCurrentlyMarkedTypingRef.current = false;
+    }
+  }, [currentUserUid]);
+
+  const handleComposerInputChange = (newVal: string) => {
+    setInputText(newVal);
+
+    const myUid = currentUserUid || auth.currentUser?.uid;
+    const targetUid =
+      selectedContact?.uid ||
+      (!selectedContact?.isGroup && !DEMO_CONTACT_IDS.has(selectedContact?.id)
+        ? selectedContact?.id
+        : '');
+    if (!myUid || !targetUid || selectedContact?.isGroup || myUid === targetUid) {
+      return;
+    }
+    const chatId =
+      selectedContact?.chatId || getDeterministicChatId(myUid, targetUid);
+    activeChatIdForTypingRef.current = chatId;
+
+    if (newVal.trim().length > 0) {
+      if (!isCurrentlyMarkedTypingRef.current) {
+        isCurrentlyMarkedTypingRef.current = true;
+        setTypingStatusInFirestore(chatId, myUid, true).catch(() => {});
+      }
+      if (typingInactivityTimerRef.current) {
+        clearTimeout(typingInactivityTimerRef.current);
+      }
+      typingInactivityTimerRef.current = setTimeout(() => {
+        stopTypingNow();
+      }, 2500);
+    } else {
+      stopTypingNow();
+    }
+  };
+
   // Send Text Message (Supports both 1-on-1 AND Group Chat! Prevents duplicate sends via unique ID + dedupe lock)
   const handleSendMessage = (e?: React.FormEvent) => {
     if (e) e.preventDefault();
+    stopTypingNow();
+    if (editingMessage) {
+      handleSaveEditMessage();
+      return;
+    }
     const trimmedText = inputText.trim();
     if (!trimmedText || !selectedContact || selectedContact.isBlocked) return;
 
@@ -4089,35 +4289,53 @@ export default function App() {
                           </span>
                         )}
                       </div>
-                      <div className="flex items-center gap-1.5 text-[11px] truncate">
-                        {selectedContact.username && (
-                          <>
+                      {isOtherUserTyping || selectedContact.isTyping ? (
+                        <div className="flex items-center gap-1.5 text-xs text-emerald-400 font-bold transition-all animate-in fade-in duration-150">
+                          <span className="flex gap-1 items-center">
                             <span
-                              dir="ltr"
-                              className="font-mono text-cyan-400 font-semibold"
-                            >
-                              @{selectedContact.username.replace(/^@/, '')}
-                            </span>
-                            <span className="text-slate-600">•</span>
-                          </>
-                        )}
-                        <span
-                          dir="ltr"
-                          className="font-mono text-emerald-400/90"
-                        >
-                          {selectedContact.phone}
-                        </span>
-                        <span className="text-slate-500">•</span>
-                        <span className="text-slate-300 truncate">
-                          {selectedContact.isBlocked
-                            ? 'محظور'
-                            : selectedContact.isTyping
-                            ? 'يكتب الآن...'
-                            : selectedContact.isGroup
-                            ? `${selectedContact.groupMembers?.length || selectedContact.membersCount || 3} أعضاء في المجموعة`
-                            : selectedContact.lastSeen}
-                        </span>
-                      </div>
+                              className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-bounce"
+                              style={{ animationDelay: '0ms' }}
+                            />
+                            <span
+                              className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-bounce"
+                              style={{ animationDelay: '150ms' }}
+                            />
+                            <span
+                              className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-bounce"
+                              style={{ animationDelay: '300ms' }}
+                            />
+                          </span>
+                          <span className="tracking-wide">يكتب الآن...</span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-1.5 text-[11px] truncate">
+                          {selectedContact.username && (
+                            <>
+                              <span
+                                dir="ltr"
+                                className="font-mono text-cyan-400 font-semibold"
+                              >
+                                @{selectedContact.username.replace(/^@/, '')}
+                              </span>
+                              <span className="text-slate-600">•</span>
+                            </>
+                          )}
+                          <span
+                            dir="ltr"
+                            className="font-mono text-emerald-400/90"
+                          >
+                            {selectedContact.phone}
+                          </span>
+                          <span className="text-slate-500">•</span>
+                          <span className="text-slate-300 truncate">
+                            {selectedContact.isBlocked
+                              ? 'محظور'
+                              : selectedContact.isGroup
+                              ? `${selectedContact.groupMembers?.length || selectedContact.membersCount || 3} أعضاء في المجموعة`
+                              : selectedContact.lastSeen}
+                          </span>
+                        </div>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -4788,7 +5006,7 @@ export default function App() {
                             <button
                               key={em}
                               type="button"
-                              onClick={() => setInputText((prev) => prev + em)}
+                              onClick={() => handleComposerInputChange(inputText + em)}
                               className="text-xl hover:scale-125 transition-transform p-1.5 rounded-xl hover:bg-white/10 flex items-center justify-center cursor-pointer"
                             >
                               {em}
@@ -4884,7 +5102,7 @@ export default function App() {
                       <input
                         type="text"
                         value={inputText}
-                        onChange={(e) => setInputText(e.target.value)}
+                        onChange={(e) => handleComposerInputChange(e.target.value)}
                         placeholder={
                           selectedContact.isGroup
                             ? `اكتب رسالة إلى مجموعة "${selectedContact.name}"...`

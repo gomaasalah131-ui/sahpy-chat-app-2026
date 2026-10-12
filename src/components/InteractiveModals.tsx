@@ -33,6 +33,9 @@ import {
   Heart,
   Camera,
   Lock,
+  Mail,
+  AlertCircle,
+  RefreshCw,
 } from 'lucide-react';
 import { Contact, StoryItem, WallpaperThemeId } from '../types/chat';
 import {
@@ -50,6 +53,10 @@ import {
   buildNormalizedPhoneSearchCandidates,
   formatDisplayPhone,
   normalizeUserAvatarUrl,
+  checkUsernameAvailability,
+  changeUserEmailInFirebaseAuth,
+  sanitizeUsername,
+  isValidUsernameFormat,
 } from '../lib/firebase';
 
 export function formatRemaining24h(expiresAt?: number): string {
@@ -1510,6 +1517,8 @@ export const CreateGroupModal: React.FC<CreateGroupModalProps> = ({
 interface ProfileModalProps {
   userName: string;
   userPhone: string;
+  userUsername?: string;
+  userEmail?: string;
   userBio: string;
   userAvatar: string;
   onClose: () => void;
@@ -1517,13 +1526,16 @@ interface ProfileModalProps {
     name: string,
     phone: string,
     bio: string,
-    avatar?: string
-  ) => void;
+    avatar?: string,
+    newUsername?: string
+  ) => Promise<void> | void;
 }
 
 export const ProfileModal: React.FC<ProfileModalProps> = ({
   userName,
   userPhone,
+  userUsername = '',
+  userEmail = '',
   userBio,
   userAvatar,
   onClose,
@@ -1533,12 +1545,77 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
     formatDisplayPhone(userPhone)
   );
   const [name, setName] = useState(userName);
+  const [username, setUsername] = useState(userUsername || '');
+  const [usernameChecking, setUsernameChecking] = useState(false);
+  const [usernameStatus, setUsernameStatus] = useState<{
+    valid: boolean;
+    available?: boolean;
+    message?: string;
+  }>({ valid: true });
   const [countryCode, setCountryCode] = useState(initialSplit.countryCode);
   const [phoneDigits, setPhoneDigits] = useState(initialSplit.localDigits);
   const [bio, setBio] = useState(userBio);
   const [avatar, setAvatar] = useState(userAvatar);
   const [phoneError, setPhoneError] = useState('');
+  const [isSaving, setIsSaving] = useState(false);
+
+  // Email Change State
+  const [isChangingEmail, setIsChangingEmail] = useState(false);
+  const [newEmail, setNewEmail] = useState('');
+  const [emailStatus, setEmailStatus] = useState<{
+    loading: boolean;
+    success?: boolean;
+    message?: string;
+  }>({ loading: false });
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const currentUid = auth.currentUser?.uid || '';
+  const currentAuthEmail = auth.currentUser?.email || userEmail;
+  const isEmailVerified = Boolean(auth.currentUser?.emailVerified);
+
+  // Live Username Validation & Availability Check
+  useEffect(() => {
+    const clean = sanitizeUsername(username);
+    if (!clean || clean === userUsername) {
+      setUsernameStatus({ valid: true });
+      return;
+    }
+    if (!isValidUsernameFormat(clean)) {
+      setUsernameStatus({
+        valid: false,
+        message: 'اسم المستخدم يجب أن يكون بين 3 و30 حرفاً (أحرف إنجليزية صغيرة، أرقام، أو _ فقط).',
+      });
+      return;
+    }
+
+    let cancelled = false;
+    setUsernameChecking(true);
+    const timer = setTimeout(async () => {
+      try {
+        const res = await checkUsernameAvailability(clean, currentUid);
+        if (!cancelled) {
+          setUsernameStatus({
+            valid: true,
+            available: res.available,
+            message: res.available
+              ? '✓ اسم المستخدم متاح ويمكنك استخدامه.'
+              : '✗ اسم المستخدم محجوز بالفعل من قبل حساب آخر.',
+          });
+        }
+      } catch {
+        if (!cancelled) {
+          setUsernameStatus({ valid: true, available: true });
+        }
+      } finally {
+        if (!cancelled) setUsernameChecking(false);
+      }
+    }, 400);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [username, userUsername, currentUid]);
 
   const handleAvatarFileChange = async (
     e: React.ChangeEvent<HTMLInputElement>
@@ -1553,9 +1630,31 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
     }
   };
 
-  const handleSave = (e: React.FormEvent) => {
+  const handleSendEmailChange = async () => {
+    if (!newEmail.trim()) {
+      setEmailStatus({ loading: false, success: false, message: 'يرجى إدخال البريد الإلكتروني الجديد.' });
+      return;
+    }
+    setEmailStatus({ loading: true, message: 'جاري إرسال رابط تأكيد التغيير...' });
+    const res = await changeUserEmailInFirebaseAuth(newEmail.trim());
+    setEmailStatus({
+      loading: false,
+      success: res.success,
+      message: res.message,
+    });
+    if (res.success) {
+      setNewEmail('');
+    }
+  };
+
+  const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     setPhoneError('');
+
+    if (usernameStatus.available === false) {
+      return;
+    }
+
     const phoneCheck = isValidPhoneE164Format(countryCode, phoneDigits, {
       optional: true,
     });
@@ -1566,18 +1665,27 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
       );
       return;
     }
-    onSaveProfile(
-      name.trim() || userName,
-      phoneCheck.e164,
-      bio.trim() || userBio,
-      avatar
-    );
-    onClose();
+
+    setIsSaving(true);
+    try {
+      await onSaveProfile(
+        name.trim() || userName,
+        phoneCheck.e164,
+        bio.trim() || userBio,
+        avatar,
+        sanitizeUsername(username) || userUsername
+      );
+      onClose();
+    } catch (err) {
+      setPhoneError(err instanceof Error ? err.message : 'حدث خطأ أثناء حفظ الملف الشخصي.');
+    } finally {
+      setIsSaving(false);
+    }
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md animate-fade-in">
-      <div className="w-full max-w-md rounded-3xl bg-slate-900 border border-white/15 shadow-2xl overflow-hidden">
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md animate-fade-in">
+      <div className="w-full max-w-lg rounded-3xl bg-slate-900 border border-white/15 shadow-2xl overflow-hidden flex flex-col max-h-[92vh]">
         <div className="p-5 border-b border-white/10 flex items-center justify-between">
           <div className="flex items-center gap-2.5">
             <div className="w-9 h-9 rounded-xl bg-emerald-500/15 border border-emerald-500/30 flex items-center justify-center text-emerald-400">
@@ -1585,10 +1693,10 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
             </div>
             <div>
               <h3 className="text-base font-bold text-white">
-                الملف الشخصي الموثق في SAHPY-CHAT
+                تعديل الملف الشخصي والحساب
               </h3>
               <p className="text-[11px] text-slate-400">
-                𝔼𝕟𝕘𝕚𝕟𝕖𝕖𝕣 𝕊𝔸𝕃𝔸ℍ 𝔾𝕆𝕄𝔸𝔸
+                SAHPY-CHAT • بيانات الحساب الموثق في Firebase
               </p>
             </div>
           </div>
@@ -1600,8 +1708,9 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
           </button>
         </div>
 
-        <form onSubmit={handleSave} className="p-5 space-y-4">
-          <div className="flex items-center gap-4 p-3 rounded-2xl bg-slate-800/50 border border-white/5">
+        <form onSubmit={handleSave} className="p-5 space-y-4 overflow-y-auto custom-scrollbar flex-1">
+          {/* Avatar & UID Card */}
+          <div className="flex items-center gap-4 p-3.5 rounded-2xl bg-slate-800/50 border border-white/5">
             <div
               onClick={() => fileInputRef.current?.click()}
               className="relative w-16 h-16 rounded-2xl overflow-hidden border-2 border-emerald-500/40 cursor-pointer group shrink-0"
@@ -1619,15 +1728,15 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-1.5 text-emerald-400 text-xs font-medium mb-0.5">
                 <ShieldCheck className="w-4 h-4" />
-                <span>حساب موثق على Firebase</span>
+                <span>حساب موثق في Firebase Firestore</span>
               </div>
               <p className="text-sm font-bold text-white truncate">{name}</p>
-              {auth.currentUser?.uid && (
+              {currentUid && (
                 <p
                   className="text-[10px] text-cyan-400 font-mono truncate"
                   dir="ltr"
                 >
-                  UID: {auth.currentUser.uid}
+                  UID: {currentUid}
                 </p>
               )}
               <button
@@ -1636,7 +1745,7 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
                 className="mt-1.5 px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/30 text-emerald-300 text-[11px] font-bold inline-flex items-center gap-1.5 transition-colors cursor-pointer"
               >
                 <Upload className="w-3 h-3" />
-                <span>تغيير صورة البروفايل</span>
+                <span>رفع صورة جديدة</span>
               </button>
               <input
                 ref={fileInputRef}
@@ -1646,23 +1755,147 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
                 className="hidden"
               />
             </div>
-            <div className="p-2.5 rounded-xl bg-white/5 border border-white/10 text-slate-300">
-              <QrCode className="w-6 h-6" />
-            </div>
           </div>
 
+          {/* Display Name */}
           <div>
-            <label className="block text-xs text-slate-400 mb-1.5">
-              الاسم المعروض
+            <label className="block text-xs font-bold text-slate-300 mb-1.5">
+              الاسم المعروض (Display Name) *
             </label>
             <input
               type="text"
               value={name}
               onChange={(e) => setName(e.target.value)}
+              placeholder="اسمك الظاهر للأصدقاء..."
               className="w-full py-2.5 px-3.5 rounded-xl bg-slate-800/90 border border-white/10 text-sm text-white focus:outline-none focus:border-emerald-500/50"
+              required
             />
           </div>
 
+          {/* Unique Username (@username) */}
+          <div>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-xs font-bold text-slate-300">
+                اسم المستخدم الفريد (@username) *
+              </label>
+              {usernameChecking && (
+                <span className="text-[10px] text-emerald-400 flex items-center gap-1">
+                  <RefreshCw className="w-3 h-3 animate-spin" />
+                  جاري التحقق من التوافر...
+                </span>
+              )}
+            </div>
+            <div className="relative" dir="ltr">
+              <span className="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400 font-mono text-sm">
+                @
+              </span>
+              <input
+                type="text"
+                value={username}
+                onChange={(e) => setUsername(e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, ''))}
+                placeholder="username_example"
+                className={`w-full py-2.5 pl-8 pr-3.5 rounded-xl bg-slate-800/90 border text-sm text-white font-mono focus:outline-none ${
+                  usernameStatus.available === false
+                    ? 'border-rose-500 focus:border-rose-500'
+                    : usernameStatus.available === true && username !== userUsername
+                    ? 'border-emerald-500 focus:border-emerald-500'
+                    : 'border-white/10 focus:border-emerald-500/50'
+                }`}
+                required
+              />
+            </div>
+            {usernameStatus.message && (
+              <p
+                className={`text-[11px] mt-1 font-medium ${
+                  usernameStatus.available === false || !usernameStatus.valid
+                    ? 'text-rose-400'
+                    : 'text-emerald-400'
+                }`}
+              >
+                {usernameStatus.message}
+              </p>
+            )}
+            <p className="text-[10px] text-slate-400 mt-1">
+              اسم المستخدم هو معرّفك الدائم في البحث ولا يتكرر. تغيير الاسم يحتفظ بجميع محادثاتك وسجل رسائلك بنفس المعرّف (UID).
+            </p>
+          </div>
+
+          {/* Email Section & Change Email */}
+          <div className="p-3.5 rounded-2xl bg-slate-800/40 border border-white/10 space-y-2">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Mail className="w-4 h-4 text-emerald-400" />
+                <span className="text-xs font-bold text-white">البريد الإلكتروني الموثق:</span>
+              </div>
+              <span
+                className={`px-2 py-0.5 rounded-md text-[10px] font-bold ${
+                  isEmailVerified
+                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                    : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                }`}
+              >
+                {isEmailVerified ? 'مفعل ومؤكد ✓' : 'غير مؤكد'}
+              </span>
+            </div>
+            <p className="text-xs font-mono text-slate-300 truncate" dir="ltr">
+              {currentAuthEmail || 'لا يوجد بريد مسجل'}
+            </p>
+
+            {!isChangingEmail ? (
+              <button
+                type="button"
+                onClick={() => setIsChangingEmail(true)}
+                className="text-[11px] text-cyan-400 hover:underline font-medium cursor-pointer pt-1 inline-block"
+              >
+                تغيير البريد الإلكتروني ←
+              </button>
+            ) : (
+              <div className="pt-2 border-t border-white/10 space-y-2">
+                <label className="block text-[11px] text-slate-300 font-bold">
+                  أدخل البريد الإلكتروني الجديد:
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="email"
+                    dir="ltr"
+                    value={newEmail}
+                    onChange={(e) => setNewEmail(e.target.value)}
+                    placeholder="new-email@gmail.com"
+                    className="flex-1 py-1.5 px-3 rounded-xl bg-slate-900 border border-white/15 text-xs text-white focus:outline-none focus:border-emerald-400"
+                  />
+                  <button
+                    type="button"
+                    disabled={emailStatus.loading}
+                    onClick={handleSendEmailChange}
+                    className="px-3 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-xs transition-all cursor-pointer shrink-0"
+                  >
+                    {emailStatus.loading ? 'جاري الإرسال...' : 'إرسال رابط التأكيد'}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setIsChangingEmail(false);
+                      setEmailStatus({ loading: false });
+                    }}
+                    className="p-1.5 text-slate-400 hover:text-white cursor-pointer"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+                {emailStatus.message && (
+                  <p
+                    className={`text-[11px] ${
+                      emailStatus.success ? 'text-emerald-300' : 'text-rose-300'
+                    }`}
+                  >
+                    {emailStatus.message}
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Phone Number */}
           <div>
             <div className="flex items-center justify-between flex-wrap gap-1 mb-1.5">
               <label className="text-xs text-slate-300 font-bold">
@@ -1709,16 +1942,17 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
               />
             </div>
             <p className="text-[11px] text-slate-400 mt-1">
-              رقم الهاتف اختياري وغير مؤكد بـ SMS، ويُستخدم فقط لتمكين المستخدمين من العثور على حسابك عند البحث بالرقم.
+              يدعم الأرقام المصرية (010, 011, 012, 015) مع كود الدولة (+20) بدون تكرار.
             </p>
             {phoneError && (
               <p className="text-xs text-rose-400 mt-1">{phoneError}</p>
             )}
           </div>
 
+          {/* Bio */}
           <div>
             <label className="block text-xs text-slate-400 mb-1.5">
-              الحالة (Bio)
+              الحالة / النبذة الشخصية (Bio)
             </label>
             <input
               type="text"
@@ -1730,9 +1964,17 @@ export const ProfileModal: React.FC<ProfileModalProps> = ({
 
           <button
             type="submit"
-            className="w-full py-3 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm transition-all cursor-pointer shadow-lg shadow-emerald-500/20"
+            disabled={isSaving || usernameStatus.available === false}
+            className="w-full py-3.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-sm transition-all cursor-pointer shadow-lg shadow-emerald-500/20 flex items-center justify-center gap-2"
           >
-            حفظ وتحديث الحساب في Firestore
+            {isSaving ? (
+              <>
+                <RefreshCw className="w-4 h-4 animate-spin" />
+                <span>جاري حفظ وتحديث البيانات في Firestore...</span>
+              </>
+            ) : (
+              <span>حفظ وتحديث الحساب في Firestore</span>
+            )}
           </button>
         </form>
       </div>

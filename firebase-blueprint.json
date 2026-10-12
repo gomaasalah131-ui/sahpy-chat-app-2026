@@ -640,6 +640,40 @@
         "createdAt",
         "updatedAt"
       ]
+    },
+    "TypingState": {
+      "title": "TypingState",
+      "description": "Transient typing state document for an authorized chat participant.",
+      "type": "object",
+      "properties": {
+        "chatId": {
+          "type": "string",
+          "description": "Deterministic or authorized chat room ID.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the participant.",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "isTyping": {
+          "type": "boolean",
+          "description": "Whether the user is actively typing text."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server timestamp of the typing state update."
+        }
+      },
+      "required": [
+        "chatId",
+        "uid",
+        "isTyping",
+        "updatedAt"
+      ]
     }
   },
   "firestore": {
@@ -666,6 +700,10 @@
     "/chats/{chatId}/messages/{messageId}": {
       "schema": { "$ref": "#/entities/DirectMessage" },
       "description": "Stores real-time direct messages inside a chat room; accessible only to the two authorized participants."
+    },
+    "/chats/{chatId}/typing/{userId}": {
+      "schema": { "$ref": "#/entities/TypingState" },
+      "description": "Stores transient real-time typing indicator status for an authorized chat participant."
     },
     "/users/{userId}/contacts/{contactId}": {
       "schema": { "$ref": "#/entities/SavedContact" },

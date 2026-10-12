@@ -52,6 +52,8 @@ export interface ChatMessagePayload {
   stickerLabel?: string;
   stickerGradient?: string;
   stickerPackId?: string;
+  isEdited?: boolean;
+  editedAt?: number;
   replyTo?: {
     id: string;
     senderName: string;
@@ -689,6 +691,38 @@ async function startServer() {
     saveStore(store);
     broadcast({ type: 'message:new', message: msg });
     res.json({ message: msg });
+  });
+
+  // REST API: Edit text message
+  app.put('/api/messages/:messageId', (req, res) => {
+    const { messageId } = req.params;
+    const { text } = req.body || {};
+    const cleanText = String(text || '').trim();
+    if (!cleanText) {
+      res.status(400).json({ error: 'نص الرسالة مطلوب' });
+      return;
+    }
+    const msg = store.messages.find((m) => m.id === messageId);
+    if (!msg) {
+      res.status(404).json({ error: 'الرسالة غير موجودة' });
+      return;
+    }
+    if (msg.type !== 'text') {
+      res.status(400).json({ error: 'يمكن تعديل الرسائل النصية فقط' });
+      return;
+    }
+    msg.text = cleanText;
+    msg.isEdited = true;
+    msg.editedAt = Date.now();
+    saveStore(store);
+    broadcast({
+      type: 'message:edit',
+      messageId,
+      text: cleanText,
+      isEdited: true,
+      editedAt: msg.editedAt,
+    });
+    res.json({ ok: true, message: msg });
   });
 
   // REST API: Clear or delete conversation messages

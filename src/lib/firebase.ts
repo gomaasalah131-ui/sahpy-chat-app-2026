@@ -12,6 +12,8 @@ import {
   sendPasswordResetEmail,
   applyActionCode,
   updateProfile,
+  updateEmail,
+  verifyBeforeUpdateEmail,
   onAuthStateChanged,
   User,
 } from 'firebase/auth';
@@ -469,39 +471,45 @@ export function buildNormalizedPhoneSearchCandidates(
   preferredCountryCode = '+20'
 ): string[] {
   const ascii = toAsciiDigits(String(rawQuery || '').trim());
-  // Only treat as phone search if input has at least 7 digits and no letters
   if (/[a-zA-Z\u0600-\u06FF]/.test(ascii)) {
     return [];
   }
   const digitsOnly = ascii.replace(/\D/g, '');
-  if (digitsOnly.length < 7 || digitsOnly.length > 16) {
+  if (digitsOnly.length < 7 || digitsOnly.length > 18) {
     return [];
   }
 
   const candidates = new Set<string>();
+  const cleanPrefCode = preferredCountryCode.replace(/\D/g, '') || '20';
 
-  const primary = normalizePhoneToE164(ascii, preferredCountryCode);
+  // 1. Primary candidate normalized with preferred country code (handles '010...', '+2010...', '002010...')
+  const primary = normalizePhoneToE164(ascii, `+${cleanPrefCode}`);
   if (primary.valid && primary.e164) {
     candidates.add(primary.e164);
   }
 
-  // If user typed a full international number without '+'
-  if (!digitsOnly.startsWith('0') && digitsOnly.length >= 9 && digitsOnly.length <= 15) {
-    candidates.add(`+${digitsOnly}`);
-  }
-
-  // If user typed a local number starting with 0 (e.g. 010... or 05...), also test common regional country codes
-  const localPart = digitsOnly.replace(/^0+/, '');
-  if (localPart.length >= 7 && localPart.length <= 11) {
-    for (const cc of ['20', '966', '971', '965', '974', '962', '964', '212', '1']) {
-      const cand = `+${cc}${localPart}`;
-      if (/^\+[1-9]\d{6,14}$/.test(cand)) {
-        candidates.add(cand);
-      }
+  // 2. If user explicitly entered international prefix ('+' or '00')
+  if (ascii.startsWith('+') || ascii.startsWith('00')) {
+    const directIntl = normalizePhoneToE164(ascii, `+${cleanPrefCode}`);
+    if (directIntl.valid && directIntl.e164) {
+      candidates.add(directIntl.e164);
     }
   }
 
-  return Array.from(candidates).slice(0, 4);
+  // 3. If entered without '+' but starting with country code (e.g. '201012345678')
+  if (digitsOnly.startsWith(cleanPrefCode) && digitsOnly.length >= cleanPrefCode.length + 7) {
+    candidates.add(`+${digitsOnly}`);
+  }
+
+  // 4. If entered local number starting with 0 (e.g. '01012345678'), format with preferred country code
+  if (digitsOnly.startsWith('0')) {
+    const withoutZero = digitsOnly.replace(/^0+/, '');
+    if (withoutZero.length >= 7) {
+      candidates.add(`+${cleanPrefCode}${withoutZero}`);
+    }
+  }
+
+  return Array.from(candidates).filter((c) => /^\+[1-9]\d{6,18}$/.test(c)).slice(0, 4);
 }
 
 export function translateFirebaseAuthError(error: unknown): string {
@@ -1669,7 +1677,6 @@ export async function findRegisteredUserInFirestore(
   // 1. Try lookup by exact @username in /usernames/{username}
   const candidateUsername = sanitizeUsername(trimmed);
   if (isValidUsernameFormat(candidateUsername)) {
-    const usernamePath = `usernames/${candidateUsername}`;
     try {
       const unameSnap = await getDoc(doc(db, 'usernames', candidateUsername));
       if (unameSnap.exists()) {
@@ -1721,7 +1728,7 @@ export async function findRegisteredUserInFirestore(
         }
       }
     } catch (error) {
-      handleFirestoreError(error, OperationType.GET, usernamePath);
+      console.warn('Firestore username lookup skipped:', error);
     }
   }
 
@@ -1731,7 +1738,6 @@ export async function findRegisteredUserInFirestore(
     preferredCountryCode
   );
   for (const phoneKey of phoneCandidates) {
-    const phonePath = `phone_index/${phoneKey}`;
     try {
       const phoneSnap = await getDoc(doc(db, 'phone_index', phoneKey));
       if (phoneSnap.exists()) {
@@ -1783,7 +1789,7 @@ export async function findRegisteredUserInFirestore(
         }
       }
     } catch (error) {
-      handleFirestoreError(error, OperationType.GET, phonePath);
+      console.warn('Firestore phone lookup candidate skipped:', error);
     }
   }
 
@@ -1793,7 +1799,6 @@ export async function findRegisteredUserInFirestore(
     /^[a-zA-Z0-9_-]{6,128}$/.test(candidateUid) &&
     phoneCandidates.length === 0
   ) {
-    const dirPath = `directory/${candidateUid}`;
     try {
       const dirSnap = await getDoc(doc(db, 'directory', candidateUid));
       if (dirSnap.exists()) {
@@ -1819,30 +1824,31 @@ export async function findRegisteredUserInFirestore(
         return found;
       }
     } catch (error) {
-      handleFirestoreError(error, OperationType.GET, dirPath);
+      console.warn('Firestore directory UID lookup skipped:', error);
     }
   }
 
-  // 4. Fallback to backend privacy-preserving search endpoint (supports searching legacy profiles by normalized phone or username)
+  // 4. Fallback to backend search endpoint (supports searching profiles by normalized phone, username, or UID)
   try {
     const res = await fetch(
       `/api/users/search?q=${encodeURIComponent(trimmed)}&cc=${encodeURIComponent(preferredCountryCode)}`
     );
     if (res.ok) {
       const data = await res.json();
-      if (data?.user?.uid) {
-        const uidVal = String(data.user.uid);
-        const displayName = String(data.user.name || data.user.displayName || '');
+      const firstMatched = data?.user || (Array.isArray(data?.users) ? data.users[0] : null);
+      if (firstMatched && (firstMatched.uid || firstMatched.id)) {
+        const uidVal = String(firstMatched.uid || firstMatched.id);
+        const displayName = String(firstMatched.name || firstMatched.displayName || '');
         const found: PublicDirectoryUser = {
           uid: uidVal,
-          username: String(data.user.username || ''),
+          username: String(firstMatched.username || ''),
           displayName,
-          bio: String(data.user.bio || ''),
+          bio: String(firstMatched.bio || ''),
           avatarFallbackColor: 'bg-emerald-600',
-          emailVerified: Boolean(data.user.emailVerified ?? true),
+          emailVerified: Boolean(firstMatched.emailVerified ?? true),
           phoneVerified: false,
           avatarUrl: normalizeUserAvatarUrl(
-            String(data.user.avatar || data.user.avatarUrl || ''),
+            String(firstMatched.avatar || firstMatched.avatarUrl || ''),
             uidVal,
             displayName
           ),
@@ -3115,3 +3121,302 @@ export async function sendMessageToFirestore(msg: {
     msg.senderName
   ).catch(() => {});
 }
+
+export async function editDirectMessageInFirestore(params: {
+  myUid: string;
+  otherUid?: string;
+  chatId?: string;
+  messageId: string;
+  newText: string;
+}): Promise<boolean> {
+  if (!auth.currentUser || !params.messageId || !params.newText.trim()) return false;
+  const myUid = params.myUid || auth.currentUser.uid;
+  const newText = params.newText.trim();
+  const effectiveChatId =
+    params.chatId ||
+    (params.otherUid && myUid !== params.otherUid
+      ? buildDeterministicChatId(myUid, params.otherUid)
+      : '');
+
+  let updated = false;
+  if (effectiveChatId) {
+    try {
+      const msgRef = doc(db, 'chats', effectiveChatId, 'messages', params.messageId);
+      await updateDoc(msgRef, {
+        text: newText,
+        isEdited: true,
+        editedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      updated = true;
+    } catch {
+      // non-fatal
+    }
+  }
+
+  if (params.otherUid) {
+    try {
+      const contactMsgRef = doc(
+        db,
+        'users',
+        myUid,
+        'contacts',
+        params.otherUid,
+        'messages',
+        params.messageId
+      );
+      await updateDoc(contactMsgRef, {
+        text: newText,
+        isEdited: true,
+        editedAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      updated = true;
+    } catch {
+      // non-fatal
+    }
+  }
+
+  return updated;
+}
+
+export async function changeUsernameInFirestore(params: {
+  myUid: string;
+  currentUsername: string;
+  newUsername: string;
+  displayName?: string;
+  bio?: string;
+  avatarUrl?: string;
+}): Promise<{ success: boolean; error?: string }> {
+  if (!auth.currentUser || auth.currentUser.uid !== params.myUid) {
+    return { success: false, error: 'غير مصرح بتنفيذ هذه العملية دون تسجيل دخول صالح.' };
+  }
+  const cleanNewUser = sanitizeUsername(params.newUsername);
+  if (!isValidUsernameFormat(cleanNewUser)) {
+    return {
+      success: false,
+      error: 'اسم المستخدم يجب أن يكون بين 3 و30 حرفاً (أحرف إنجليزية صغيرة، أرقام، أو _).',
+    };
+  }
+
+  const cleanOldUser = sanitizeUsername(params.currentUsername);
+  if (cleanNewUser === cleanOldUser) {
+    return { success: true };
+  }
+
+  const avail = await checkUsernameAvailability(cleanNewUser, params.myUid);
+  if (!avail.available) {
+    return {
+      success: false,
+      error: 'اسم المستخدم محجوز ومستخدم بالفعل من قبل حساب آخر.',
+    };
+  }
+
+  const newUnameRef = doc(db, 'usernames', cleanNewUser);
+  const userRef = doc(db, 'users', params.myUid);
+  const dirRef = doc(db, 'directory', params.myUid);
+
+  try {
+    // 1. Create new username reservation
+    await setDoc(newUnameRef, {
+      uid: params.myUid,
+      username: cleanNewUser,
+      displayName: params.displayName || cleanNewUser,
+      bio: params.bio || '',
+      avatarFallbackColor: 'bg-emerald-600',
+      avatarUrl: params.avatarUrl || '',
+      createdAt: serverTimestamp(),
+      updatedAt: serverTimestamp(),
+    });
+
+    // 2. Update user private profile
+    await updateDoc(userRef, {
+      username: cleanNewUser,
+      updatedAt: serverTimestamp(),
+    });
+
+    // 3. Update public directory
+    await updateDoc(dirRef, {
+      username: cleanNewUser,
+      updatedAt: serverTimestamp(),
+    }).catch(() => {});
+
+    // 4. Delete old username reservation
+    if (cleanOldUser && cleanOldUser !== cleanNewUser) {
+      await deleteDoc(doc(db, 'usernames', cleanOldUser)).catch(() => {});
+    }
+
+    cacheUsernameEmailMapping(cleanNewUser, auth.currentUser.email || '');
+    return { success: true };
+  } catch (err) {
+    return {
+      success: false,
+      error:
+        err instanceof Error
+          ? err.message
+          : 'تعذر تغيير اسم المستخدم في Firestore.',
+    };
+  }
+}
+
+export async function changeUserEmailInFirebaseAuth(newEmail: string): Promise<{
+  success: boolean;
+  message: string;
+}> {
+  if (!auth.currentUser) {
+    return {
+      success: false,
+      message: 'يجب تسجيل الدخول أولاً لتغيير البريد الإلكتروني.',
+    };
+  }
+  const cleanEmail = String(newEmail || '').trim().toLowerCase();
+  const validCheck = validateEmailWithArabicReason(cleanEmail);
+  if (!validCheck.valid) {
+    return {
+      success: false,
+      message: validCheck.reason || 'صيغة البريد الإلكتروني غير صحيحة.',
+    };
+  }
+
+  try {
+    if (typeof verifyBeforeUpdateEmail === 'function') {
+      await verifyBeforeUpdateEmail(auth.currentUser, cleanEmail);
+      return {
+        success: true,
+        message: `تم إرسال رابط تأكيد إلى "${cleanEmail}". يرجى فتح البريد الإلكتروني والضغط على الرابط لإتمام التحديث بأمان.`,
+      };
+    } else {
+      await updateEmail(auth.currentUser, cleanEmail);
+      await sendEmailVerification(auth.currentUser).catch(() => {});
+      return {
+        success: true,
+        message: `تم تحديث البريد الإلكتروني إلى "${cleanEmail}". يرجى تأكيد البريد الجديد من رسالة التحقق.`,
+      };
+    }
+  } catch (error: any) {
+    const code = error?.code || '';
+    if (code === 'auth/requires-recent-login') {
+      return {
+        success: false,
+        message:
+          'لأسباب أمنية في Firebase، تتطلب هذه العملية إعادة تسجيل الدخول حديثاً. يرجى تسجيل الخروج ثم الدخول مجدداً.',
+      };
+    }
+    if (code === 'auth/email-already-in-use') {
+      return {
+        success: false,
+        message: 'هذا البريد الإلكتروني مسجل بالفعل بحساب آخر.',
+      };
+    }
+    if (code === 'auth/invalid-email') {
+      return {
+        success: false,
+        message: 'صيغة البريد الإلكتروني غير صالحة.',
+      };
+    }
+    return {
+      success: false,
+      message:
+        error instanceof Error
+          ? error.message
+          : 'تعذر إرسال طلب تحديث البريد الإلكتروني حالياً.',
+    };
+  }
+}
+
+/**
+ * Sets the real-time typing status of the current user in a specific Firestore chat room.
+ * Ephemeral document stored at chats/{chatId}/typing/{userId}.
+ */
+export async function setTypingStatusInFirestore(
+  chatId: string,
+  uid: string,
+  isTyping: boolean
+): Promise<void> {
+  if (!auth.currentUser || auth.currentUser.uid !== uid) {
+    return;
+  }
+  const safeChatId = sanitizeDocId(chatId);
+  const safeUid = sanitizeDocId(uid);
+  if (!safeChatId || !safeUid) return;
+
+  const typingPath = `chats/${safeChatId}/typing/${safeUid}`;
+  const typingRef = doc(db, 'chats', safeChatId, 'typing', safeUid);
+
+  try {
+    await setDoc(
+      typingRef,
+      {
+        chatId: safeChatId,
+        uid: safeUid,
+        isTyping: Boolean(isTyping),
+        updatedAt: serverTimestamp(),
+      },
+      { merge: true }
+    );
+  } catch (error) {
+    try {
+      handleFirestoreError(error, OperationType.WRITE, typingPath);
+    } catch {
+      // Ephemeral write fail ignored to keep typing responsive
+    }
+  }
+}
+
+/**
+ * Subscribes to real-time typing status of the other participant in a Firestore chat room.
+ * Invokes callback with boolean `isTyping`.
+ */
+export function subscribeToTypingStatusInFirestore(
+  chatId: string,
+  otherUid: string,
+  onTypingChanged: (isTyping: boolean) => void
+): () => void {
+  const safeChatId = sanitizeDocId(chatId);
+  const safeOtherUid = sanitizeDocId(otherUid);
+  if (!safeChatId || !safeOtherUid) {
+    onTypingChanged(false);
+    return () => {};
+  }
+
+  const typingPath = `chats/${safeChatId}/typing/${safeOtherUid}`;
+  const typingRef = doc(db, 'chats', safeChatId, 'typing', safeOtherUid);
+
+  const unsubscribe = onSnapshot(
+    typingRef,
+    (snap) => {
+      if (!snap.exists()) {
+        onTypingChanged(false);
+        return;
+      }
+      const data = snap.data();
+      const isTyping = Boolean(data?.isTyping);
+      if (!isTyping) {
+        onTypingChanged(false);
+        return;
+      }
+
+      const updatedAtVal = data?.updatedAt;
+      let updatedAtMs = Date.now();
+      if (updatedAtVal?.toMillis) {
+        updatedAtMs = updatedAtVal.toMillis();
+      } else if (updatedAtVal?.seconds) {
+        updatedAtMs = updatedAtVal.seconds * 1000;
+      }
+      // Guard against client/server clock drifts with 15s window
+      const isFresh = !updatedAtVal || Math.abs(Date.now() - updatedAtMs) < 15000;
+      onTypingChanged(isFresh);
+    },
+    (error) => {
+      onTypingChanged(false);
+      try {
+        handleFirestoreError(error, OperationType.GET, typingPath);
+      } catch {
+        // Ignored
+      }
+    }
+  );
+
+  return unsubscribe;
+}
+
